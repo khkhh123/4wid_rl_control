@@ -1,0 +1,63 @@
+import sys
+sys.path.append("/opt/ipg/carmaker/linux64-14.0.1/Python/python3.10")
+
+from pathlib import Path
+import cmapi
+from cmapi import Runtime, Project, Variation
+
+# cmapi.logger.setLevel("DEBUG")
+
+async def main():
+
+    app = cmapi.Application.create(cmapi.AppType.CarMaker)
+    app.set_executable_path(Path("/home/khkhh/CM_Projects/test1/src/CarMaker.linux64"))
+
+    project_path = Path("/home/khkhh/CM_Projects/test1")
+    Project.load(project_path)                                                  # Set Project directory
+
+    await app.start()
+
+    simcontrol = cmapi.SimControlInteractive()
+
+    testrun_path = Path("/home/khkhh/CM_Projects/test1/Data/TestRun/testrun_test1")
+    testrun = Project.instance().load_testrun_parametrization(testrun_path)     # Load Testrun example
+
+    variation = Variation.create_from_testrun(testrun)                    # Create a variation from testrun
+
+    simcontrol.set_variation(variation)
+ 
+    master = cmapi.CarMaker()
+
+    print(master)
+    print(app)
+    await simcontrol.set_master(app)
+    
+    await simcontrol.start_and_connect()
+    await simcontrol.start_sim()
+
+    simtime = 0
+
+    while simtime < 50.0:
+        simtime_raw = await simcontrol.simio.dva_read_async("Time")
+        simtime = simtime_raw[0]
+
+        # simcontrol.simio.dva_write_absolute_value("PT.WFL.Trq_Drive", 1000.0, 100)
+        # simcontrol.simio.dva_write_absolute_value("PT.WFR.Trq_Drive", 1000.0, 100)
+        # simcontrol.simio.dva_write_absolute_value("PT.WRL.Trq_Drive", 1000.0, 100)
+        # simcontrol.simio.dva_write_absolute_value("PT.WRR.Trq_Drive", 1000.0, 100)
+        # simcontrol.simio.dva_write_absolute_value("DM.Gas", 0.8, 100)
+
+        car_v = await simcontrol.simio.dva_read_async("Car.vx")
+        trq_FL = await simcontrol.simio.dva_read_async("PT.WFL.Trq_Drive")
+        gas = await simcontrol.simio.dva_read_async("DM.Gas")
+
+        print("FL trq: ", trq_FL[0])
+        print("velocity: ", car_v)
+        print("gas: ", gas[0])
+
+    await simcontrol.stop_and_disconnect()
+    await app.stop()
+
+    cmapi.logger.info("All simulations finished")
+
+cmapi.Task.run_main_task(main())                                                # Create asynchronous scope
