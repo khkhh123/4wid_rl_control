@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<PortConfigurations xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-	<MAPortConfig>
-		<ProjectDir>/home/khkhh/CM_Projects/test1</ProjectDir>
-		<Platform>office</Platform>
-	</MAPortConfig>
-</PortConfigurations>
