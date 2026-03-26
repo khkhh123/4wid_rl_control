@@ -12,8 +12,8 @@ sys.path.append("/opt/ipg/carmaker/linux64-14.0.1/Python/python3.10")
 import cmapi
 
 # 액션 크기 및 바퀴 간 불균형 패널티 가중치
-ACTION_VELOCITY_WEIGHT = float(os.getenv("ACTION_VELOCITY_WEIGHT", "1.0"))
-ACTION_EFFORT_WEIGHT = float(os.getenv("ACTION_EFFORT_WEIGHT", "10.0"))
+ACTION_VELOCITY_WEIGHT = float(os.getenv("ACTION_VELOCITY_WEIGHT", "10.0"))
+ACTION_EFFORT_WEIGHT = float(os.getenv("ACTION_EFFORT_WEIGHT", "0.0"))
 ACTION_BALANCE_WEIGHT = 0.0  # balance penalty disabled
 
 
@@ -44,15 +44,15 @@ SAC_PRESETS = {
     },
     # 공격적: 환경 샘플당 업데이트 비율 증가
     "C": {
-        "learning_rate": 1e-5,
+        "learning_rate": 1e-3,
         "buffer_size": 300000,
-        "learning_starts": 1000,
+        "learning_starts": 5000,
         "batch_size": 256,
         "tau": 0.005,
         "gamma": 0.99,
-        "train_freq": (128, "step"),
+        "train_freq": (128*64, "step"),
         "gradient_steps": 128,
-        "ent_coef": "auto_0.01",
+        "ent_coef": "auto",
     }
 }
 
@@ -113,7 +113,7 @@ def get_sac_profile():
 
 
 def get_carmaker_pid():
-    target = "CarMaker.linux64"
+    target = "CarMaker_5555.linux64"
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
             if target in proc.info['name'] or any(target in arg for arg in (proc.info['cmdline'] or [])):
@@ -124,12 +124,16 @@ def get_carmaker_pid():
 
 
 # --- 1. 독립적인 강화학습 환경 (데이터 전달 역할) ---
+
 class CarMaker4WIDEnv(gym.Env):
     def __init__(self, loop):
         super().__init__()
         self.loop = loop
         self.client_sock = None
         self.last_obs = None
+        self.step_count = 0
+        self.max_steps = int(os.getenv("EPISODE_MAX_STEPS", "500"))
+        self.early_done_penalty = float(os.getenv("EARLY_DONE_PENALTY", "-10000.0"))
 
         # 지휘자와 소통하기 위한 이벤트
         self.reset_req = asyncio.Event()
@@ -140,20 +144,18 @@ class CarMaker4WIDEnv(gym.Env):
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
 
     async def reset(self, seed=None, options=None):
-        # 지휘자에게 리셋 요청 후 준비될 때까지 대기
+        self.step_count = 0
         self.reset_req.set()
         await self.ready_evt.wait()
         self.ready_evt.clear()
         return np.array(self.last_obs, dtype=np.float32), {}
 
     async def step(self, action):
-        # 기존 step 로직: 소켓을 통해 데이터 주고받기
         try:
-            # 액션 전송
+            self.step_count += 1
             data = struct.pack('dddd', *map(float, action))
             await self.loop.run_in_executor(None, self.client_sock.sendall, data)
 
-            # 다음 상태 수신
             raw_data = await self.loop.run_in_executor(None, self.client_sock.recv, 24)
             if not raw_data or len(raw_data) < 24:
                 return np.zeros(2), 0, True, False, {}
@@ -162,18 +164,23 @@ class CarMaker4WIDEnv(gym.Env):
             self.last_obs = [curr_v, v_diff]
 
             action = np.asarray(action, dtype=np.float32)
-            velocity_penalty = ACTION_VELOCITY_WEIGHT * float(v_diff**2)
+            velocity_penalty = ACTION_VELOCITY_WEIGHT * float(v_diff**2) / 1600
             effort_penalty = ACTION_EFFORT_WEIGHT * float(np.sum(action**2))
             balance_penalty = 0.0
 
-            reward = -velocity_penalty - effort_penalty
+            reward = - velocity_penalty - effort_penalty
+            terminated = (sim_state != 8.0)
+
+            # 조기 종료 패널티 적용
+            if terminated and self.step_count < self.max_steps:
+                print(f"[EARLY DONE] step={self.step_count} < max_steps={self.max_steps} → penalty {self.early_done_penalty}")
+                reward += self.early_done_penalty
+
             print(f"[ACTION] FL={action[0]:7.4f} | FR={action[1]:7.4f} | RL={action[2]:7.4f} | RR={action[3]:7.4f}")
             print(
                 f"[REWARD] V_diff: {velocity_penalty:9.4f}"
                 f"| Effort: {effort_penalty:9.4f} | Total: {reward:9.4f}"
             )
-
-            terminated = (sim_state != 8.0)
 
             return np.array(self.last_obs, dtype=np.float32), reward, terminated, False, {}
         except Exception:
@@ -190,7 +197,7 @@ async def carmaker_orchestrator(env, simcontrol, variation, server_sock):
         env.reset_req.clear()
 
         await simcontrol.connect()
-
+        
         print("\n[Orchestrator] Starting New Episode...")
 
         # 카메이커 표준 예제 흐름
@@ -201,7 +208,7 @@ async def carmaker_orchestrator(env, simcontrol, variation, server_sock):
         simcontrol.set_variation(variation.clone())
         await simcontrol.start_sim()
         await simcontrol.create_simstate_condition(cmapi.ConditionSimState.running).wait()
-
+        simcontrol.set_realtimefactor(100.0)
         # 소켓 연결 수락 및 초기화
         env.client_sock, _ = await loop.run_in_executor(None, server_sock.accept)
         raw_obs = await loop.run_in_executor(None, env.client_sock.recv, 24)
@@ -250,12 +257,15 @@ def run_learning(env):
     if os.path.exists(best_model_path):
         print(f"--- 기존 모델 '{best_model_path}'을(를) 불러와서 학습을 재개합니다. ---")
         model = SAC.load(best_model_path, env=env, device="cpu", verbose=1)
+    # if os.path.exists(model_path):
+    #     print(f"--- 기존 모델 '{model_path}'을(를) 불러와서 학습을 재개합니다. ---")
+    #     model = SAC.load(model_path, env=env, device="cpu", verbose=1)
     else:
         print("--- 기존 모델이 없습니다. 새로운 SAC 모델을 생성합니다. ---")
         model = SAC("MlpPolicy", env, verbose=1, device="cpu", **sac_kwargs)
 
     try:
-        model.learn(total_timesteps=500000, callback=callback)
+        model.learn(total_timesteps=1000000, callback=callback)
     except KeyboardInterrupt:
         print("학습 중단 요청됨. 모델 저장 중...")
         model.save(interrupt_model_path)
@@ -282,9 +292,11 @@ async def main():
     master = cmapi.ApoServer()
     master.set_sinfo(cmapi.ApoServerInfo(pid=get_carmaker_pid(), description="Idle"))
     master.set_host("localhost")
-
+    
     simcontrol = cmapi.SimControlInteractive()
+    
     await simcontrol.set_master(master)
+    
 
     testrun = cmapi.Project.instance().load_testrun_parametrization(project_path / "Data/TestRun/testrun_test1")
     variation = cmapi.Variation.create_from_testrun(testrun)

@@ -155,7 +155,8 @@ async def main():
     simcontrol = cmapi.SimControlInteractive()
     await simcontrol.set_master(master)
 
-    testrun = cmapi.Project.instance().load_testrun_parametrization(project_path / "Data/TestRun/testrun_test_straight")
+    # testrun = cmapi.Project.instance().load_testrun_parametrization(project_path / "Data/TestRun/testrun_test_straight")
+    testrun = cmapi.Project.instance().load_testrun_parametrization(project_path / "Data/TestRun/testrun_test1")
     variation = cmapi.Variation.create_from_testrun(testrun)
 
     loop = asyncio.get_running_loop()

@@ -12,12 +12,34 @@ sys.path.append("/opt/ipg/carmaker/linux64-14.0.1/Python/python3.10")
 import cmapi
 
 
+
+# 액션 크기 및 바퀴 간 불균형 패널티 가중치
+ACTION_VELOCITY_WEIGHT = float(os.getenv("ACTION_VELOCITY_WEIGHT", "1.0"))
+ACTION_EFFORT_WEIGHT = float(os.getenv("ACTION_EFFORT_WEIGHT", "1.0"))
+ACTION_BALANCE_WEIGHT = 0.0  # balance penalty disabled
+
 class SaveBestEpisodeRewardCallback(BaseCallback):
     def __init__(self, best_model_path, verbose=1):
         super().__init__(verbose)
         self.best_model_path = best_model_path
+        self.best_reward_path = best_model_path + ".reward"
         self.current_episode_reward = 0.0
         self.best_episode_reward = -np.inf
+        # 파일에서 best reward 불러오기
+        if os.path.exists(self.best_reward_path):
+            try:
+                with open(self.best_reward_path, "r") as f:
+                    self.best_episode_reward = float(f.read().strip())
+            except Exception:
+                self.best_episode_reward = -np.inf
+
+    def _save_best_reward(self):
+        try:
+            with open(self.best_reward_path, "w") as f:
+                f.write(str(self.best_episode_reward))
+        except Exception as e:
+            if self.verbose:
+                print(f"[WARN] Failed to save best reward: {e}")
 
     def _on_step(self) -> bool:
         rewards = self.locals.get("rewards")
@@ -30,6 +52,7 @@ class SaveBestEpisodeRewardCallback(BaseCallback):
             if self.current_episode_reward > self.best_episode_reward:
                 self.best_episode_reward = self.current_episode_reward
                 self.model.save(self.best_model_path)
+                self._save_best_reward()
                 if self.verbose:
                     print(f"[BEST] episode_reward={self.best_episode_reward:.3f} -> {self.best_model_path}")
             self.current_episode_reward = 0.0
@@ -63,15 +86,15 @@ SAC_PRESETS = {
     },
     # 공격적: 환경 샘플당 업데이트 비율 증가
     "C": {
-        "learning_rate": 3e-4,
+        "learning_rate": 1e-5,
         "buffer_size": 300000,
-        "learning_starts": 5000,
+        "learning_starts": 1000,
         "batch_size": 256,
         "tau": 0.005,
         "gamma": 0.99,
         "train_freq": (128, "step"),
         "gradient_steps": 128,
-        "ent_coef": "auto",
+        "ent_coef": "auto_0.01",
     },
 }
 
@@ -101,12 +124,16 @@ def get_carmaker_pid():
 
 
 # --- 1. 독립적인 강화학습 환경 (데이터 전달 역할) ---
+
 class CarMaker4WIDEnv(gym.Env):
     def __init__(self, loop):
         super().__init__()
         self.loop = loop
         self.client_sock = None
         self.last_obs = None
+        self.step_count = 0
+        self.max_steps = int(os.getenv("EPISODE_MAX_STEPS", "500"))
+        self.early_done_penalty = float(os.getenv("EARLY_DONE_PENALTY", "-10000.0"))
 
         # 지휘자와 소통하기 위한 이벤트
         self.reset_req = asyncio.Event()
@@ -117,20 +144,18 @@ class CarMaker4WIDEnv(gym.Env):
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
 
     async def reset(self, seed=None, options=None):
-        # 지휘자에게 리셋 요청 후 준비될 때까지 대기
+        self.step_count = 0
         self.reset_req.set()
         await self.ready_evt.wait()
         self.ready_evt.clear()
         return np.array(self.last_obs, dtype=np.float32), {}
 
     async def step(self, action):
-        # 기존 step 로직: 소켓을 통해 데이터 주고받기
         try:
-            # 액션 전송
+            self.step_count += 1
             data = struct.pack('dddd', *map(float, action))
             await self.loop.run_in_executor(None, self.client_sock.sendall, data)
 
-            # 다음 상태 수신
             raw_data = await self.loop.run_in_executor(None, self.client_sock.recv, 24)
             if not raw_data or len(raw_data) < 24:
                 return np.zeros(2), 0, True, False, {}
@@ -138,8 +163,24 @@ class CarMaker4WIDEnv(gym.Env):
             curr_v, v_diff, sim_state = struct.unpack('ddd', raw_data)
             self.last_obs = [curr_v, v_diff]
 
-            reward = -float(v_diff**2) - 0.1 * np.sum(action**2)
+            action = np.asarray(action, dtype=np.float32)
+            velocity_penalty = ACTION_VELOCITY_WEIGHT * float(v_diff**2) / 1600
+            effort_penalty = ACTION_EFFORT_WEIGHT * float(np.sum(action**2))
+            balance_penalty = 0.0
+
+            reward = -velocity_penalty - effort_penalty
             terminated = (sim_state != 8.0)
+
+            # 조기 종료 패널티 적용
+            if terminated and self.step_count < self.max_steps:
+                print(f"[EARLY DONE] step={self.step_count} < max_steps={self.max_steps} → penalty {self.early_done_penalty}")
+                reward += self.early_done_penalty
+
+            print(f"[ACTION] FL={action[0]:7.4f} | FR={action[1]:7.4f} | RL={action[2]:7.4f} | RR={action[3]:7.4f}")
+            print(
+                f"[REWARD] V_diff: {velocity_penalty:9.4f}"
+                f"| Effort: {effort_penalty:9.4f} | Total: {reward:9.4f}"
+            )
 
             return np.array(self.last_obs, dtype=np.float32), reward, terminated, False, {}
         except Exception:
@@ -202,6 +243,7 @@ class SyncBridge(gym.Env):
         pass
 
 
+
 def run_learning(env):
     profile = get_sac_profile()
     sac_kwargs = SAC_PRESETS[profile]
@@ -213,15 +255,16 @@ def run_learning(env):
     print(f"--- SAC 프로필: {profile} ---")
     print(f"--- SAC 설정: {sac_kwargs} ---")
 
+    tensorboard_log = "./tensorboard_wo_cm_gui/"
     if os.path.exists(model_path):
         print(f"--- 기존 모델 '{model_path}'을(를) 불러와서 학습을 재개합니다. ---")
-        model = SAC.load(model_path, env=env, device="cpu", verbose=1)
+        model = SAC.load(model_path, env=env, device="cpu", verbose=1, tensorboard_log=tensorboard_log)
     else:
         print("--- 기존 모델이 없습니다. 새로운 SAC 모델을 생성합니다. ---")
-        model = SAC("MlpPolicy", env, verbose=1, device="cpu", **sac_kwargs)
+        model = SAC("MlpPolicy", env, verbose=1, device="cpu", tensorboard_log=tensorboard_log, **sac_kwargs)
 
     try:
-        model.learn(total_timesteps=10000000, callback=callback)
+        model.learn(total_timesteps=500000, callback=callback)
     except KeyboardInterrupt:
         print("학습 중단 요청됨. 모델 저장 중...")
         model.save(interrupt_model_path)
@@ -239,7 +282,7 @@ async def main():
     # 서버 소켓 준비
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(('127.0.0.1', 5556))
+    server_sock.bind(('127.0.0.1', 5555))
     server_sock.listen(1)
 
     project_path = Path("/home/khkhh/CM_Projects/test1")
@@ -249,7 +292,7 @@ async def main():
     # master.set_sinfo(cmapi.ApoServerInfo(pid=get_carmaker_pid(), description="Idle"))
     # master.set_host("localhost")
     master = cmapi.CarMaker()
-    master.set_executable_path(project_path / "src/CarMaker_5556.linux64")
+    master.set_executable_path(project_path / "src/CarMaker_5555.linux64")
 
     simcontrol = cmapi.SimControlInteractive()
     await simcontrol.set_master(master)

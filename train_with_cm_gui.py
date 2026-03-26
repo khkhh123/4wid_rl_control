@@ -164,10 +164,10 @@ def run_learning(env):
     model.n_steps = 4096*2 # 기본값 2048에서 4096으로 증가 (필요에 따라 더 늘릴 수 있습니다)
     model.batch_size = 256 # batch_size도 함께 조정하여 효율적인 학습을 유도할 수 있습니다.
     model.tensorboard_log=log_dir
-    model.learning_rate = 1e-3
+    model.learning_rate = 1e-4
     print("clip_range: ", model.clip_range)
     try:
-        model.learn(total_timesteps=10000000, callback=callback)
+        model.learn(total_timesteps=100000, callback=callback)
     except KeyboardInterrupt:
         print("학습 중단 요청됨. 모델 저장 중...")
         model.save(interrupt_model_path)
@@ -184,7 +184,7 @@ async def main():
     # 서버 소켓 준비
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind(('127.0.0.1', 5555))
+    server_sock.bind(('127.0.0.1', 5556))
     server_sock.listen(1)
 
     project_path = Path("/home/khkhh/CM_Projects/test1")
