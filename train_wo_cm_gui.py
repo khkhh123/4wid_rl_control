@@ -5,10 +5,35 @@ import gymnasium as gym
 from gymnasium import spaces
 from pathlib import Path
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
 
 # CarMaker API 설정
 sys.path.append("/opt/ipg/carmaker/linux64-14.0.1/Python/python3.10")
 import cmapi
+
+
+class SaveBestEpisodeRewardCallback(BaseCallback):
+    def __init__(self, best_model_path, verbose=1):
+        super().__init__(verbose)
+        self.best_model_path = best_model_path
+        self.current_episode_reward = 0.0
+        self.best_episode_reward = -np.inf
+
+    def _on_step(self) -> bool:
+        rewards = self.locals.get("rewards")
+        dones = self.locals.get("dones")
+        if rewards is None or dones is None:
+            return True
+
+        self.current_episode_reward += float(rewards[0])
+        if bool(dones[0]):
+            if self.current_episode_reward > self.best_episode_reward:
+                self.best_episode_reward = self.current_episode_reward
+                self.model.save(self.best_model_path)
+                if self.verbose:
+                    print(f"[BEST] episode_reward={self.best_episode_reward:.3f} -> {self.best_model_path}")
+            self.current_episode_reward = 0.0
+        return True
 
 def get_carmaker_pid():
     target = "CarMaker.linux64"
@@ -126,6 +151,10 @@ class SyncBridge(gym.Env):
 
 def run_learning(env):
     model_path = "carmaker_ppo_4wid1.zip"
+    best_model_path = "carmaker_ppo_4wid1_best.zip"
+    interrupt_model_path = "carmaker_ppo_4wid1_interrupt.zip"
+    callback = SaveBestEpisodeRewardCallback(best_model_path)
+
     # 1. 기존 모델이 있는지 확인
     if os.path.exists(model_path):
         print(f"--- 기존 모델 '{model_path}'을(를) 불러와서 학습을 재개합니다. ---")
@@ -136,10 +165,15 @@ def run_learning(env):
         # 새로 시작할 경우
         model = PPO("MlpPolicy", env, verbose=1, device="cpu")
 
-    model = PPO("MlpPolicy", env, verbose=1, device="cpu")
-    model.learn(total_timesteps=10000000)
-    model.save(model_path)
-    print(f"모델이 '{model_path}'에 저장되었습니다.")
+    try:
+        model.learn(total_timesteps=10000000, callback=callback)
+    except KeyboardInterrupt:
+        print("학습 중단 요청됨. 모델 저장 중...")
+        model.save(interrupt_model_path)
+        print(f"중단 시점 모델이 '{interrupt_model_path}'에 저장되었습니다.")
+    finally:
+        model.save(model_path)
+        print(f"모델이 '{model_path}'에 저장되었습니다.")
 
 async def main():
     # CarMaker 초기화 로직 (기존 main 내용)
@@ -159,7 +193,7 @@ async def main():
     # master.set_sinfo(cmapi.ApoServerInfo(pid=get_carmaker_pid(), description="Idle"))
     # master.set_host("localhost")
     master = cmapi.CarMaker()
-    master.set_executable_path(project_path / "src/CarMaker.linux64")
+    master.set_executable_path(project_path / "src/CarMaker_5555.linux64")
 
     simcontrol = cmapi.SimControlInteractive()
     await simcontrol.set_master(master)

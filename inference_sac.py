@@ -4,7 +4,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from pathlib import Path
-from stable_baselines3 import PPO
+from stable_baselines3 import SAC
 
 # CarMaker API 설정
 sys.path.append("/opt/ipg/carmaker/linux64-14.0.1/Python/python3.10")
@@ -110,12 +110,13 @@ class SyncBridge(gym.Env):
 
 
 def run_inference(env):
-    # model_path = os.getenv("MODEL_PATH", "carmaker_ppo_4wid2.zip")
-    model_path = os.getenv("MODEL_PATH", "carmaker_ppo_speedtracking.zip")
+    profile = (os.getenv("SAC_PROFILE", "B") or "B").upper()
+    default_model_path = f"carmaker_sac_4wid_gui_{profile}.zip"
+    model_path = os.getenv("MODEL_PATH", default_model_path)
     episodes = int(os.getenv("EPISODES", "1"))
 
-    print(f"Loading model from {model_path}")
-    model = PPO.load(model_path, env=env, device="cpu")
+    print(f"Loading SAC model from {model_path}")
+    model = SAC.load(model_path, env=env, device="cpu")
 
     for ep in range(episodes):
         obs, _ = env.reset()
@@ -154,7 +155,6 @@ async def main():
     simcontrol = cmapi.SimControlInteractive()
     await simcontrol.set_master(master)
 
-    # testrun = cmapi.Project.instance().load_testrun_parametrization(project_path / "Data/TestRun/testrun_test1")
     testrun = cmapi.Project.instance().load_testrun_parametrization(project_path / "Data/TestRun/testrun_test_straight")
     variation = cmapi.Variation.create_from_testrun(testrun)
 
