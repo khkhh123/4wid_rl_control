@@ -34,8 +34,21 @@ class CarMaker4WIDEnv(gym.Env):
         self.reset_req = asyncio.Event()
         self.ready_evt = asyncio.Event()
 
-        self.action_space = spaces.Box(low=-1, high=1, shape=(4,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-1, high=1, shape=(3,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
+
+    def action_to_torques(self, action):
+        """Convert action [demand_ratio, left_ratio, right_ratio] to wheel torques [FL, FR, RL, RR]."""
+        demand_ratio, left_ratio, right_ratio = action
+        base_torque = abs(demand_ratio) * 0.1
+        lr_ratio = (demand_ratio + 1) / 2
+        left_torque = base_torque * (1 - lr_ratio)
+        right_torque = base_torque * lr_ratio
+        fl = left_torque * (1 - left_ratio) / 2
+        rl = left_torque * (1 + left_ratio) / 2
+        fr = right_torque * (1 - right_ratio) / 2
+        rr = right_torque * (1 + right_ratio) / 2
+        return np.array([fl, fr, rl, rr], dtype=np.float32)
 
     async def reset(self, seed=None, options=None):
         self.reset_req.set()
@@ -45,10 +58,8 @@ class CarMaker4WIDEnv(gym.Env):
 
     async def step(self, action):
         try:
-            # action = np.ndarray([0.038282768, 0.038282768, 0.038282768, 0.038282768])
-            # action[:] = np.array([0.0395, 0.0395, 0.0395, 0.0395], dtype=np.float32)
-            # print(action.type, action.shape, action)
-            data = struct.pack("dddd", *map(float, action))
+            torques = self.action_to_torques(action)
+            data = struct.pack("dddd", *map(float, torques))
             await self.loop.run_in_executor(None, self.client_sock.sendall, data)
 
             raw_data = await self.loop.run_in_executor(None, self.client_sock.recv, 24)

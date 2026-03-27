@@ -44,7 +44,7 @@ SAC_PRESETS = {
     },
     # 공격적: 환경 샘플당 업데이트 비율 증가
     "C": {
-        "learning_rate": 1.5e-4,
+        "learning_rate": 1.0e-3,
         "buffer_size": 100000000,
         "learning_starts": 5000,
         "batch_size": 256,
@@ -139,7 +139,8 @@ class CarMaker4WIDEnv(gym.Env):
         self.ready_evt = asyncio.Event()
         self.stop_req = asyncio.Event()  # 종료 신호
 
-        self.action_space = spaces.Box(low=-1, high=1, shape=(4,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-1, high=1, shape=(3,), dtype=np.float32)
+
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
 
     async def reset(self, seed=None, options=None):
@@ -151,10 +152,38 @@ class CarMaker4WIDEnv(gym.Env):
         print(f"[EPISODE] {self.episode_count} started")
         return np.array(self.last_obs, dtype=np.float32), {}
 
+    def action_to_torques(self, action):
+        """Convert action [demand_ratio, left_ratio, right_ratio] to wheel torques [FL, FR, RL, RR].
+        
+        Args:
+            action: shape (3,)
+                action[0]: base torque demand (-1 ~ 1), sign determines L/R, abs determines magnitude
+                action[1]: left wheel front/rear ratio (-1: front 100%, 1: rear 100%)
+                action[2]: right wheel front/rear ratio (-1: front 100%, 1: rear 100%)
+        
+        Returns:
+            torques: [FL, FR, RL, RR] shape (4,)
+        """
+        demand_ratio, left_ratio, right_ratio = action
+        base_torque = abs(demand_ratio) * 0.1  # Scale to [0, 0.1]
+        lr_ratio = (demand_ratio + 1) / 2  # Convert [-1, 1] to [0, 1]: 0=left, 1=right
+        
+        left_torque = base_torque * (1 - lr_ratio)
+        right_torque = base_torque * lr_ratio
+        
+        # Front/rear distribution: -1 = front 100%, 1 = rear 100%
+        fl = left_torque * (1 - left_ratio) / 2
+        rl = left_torque * (1 + left_ratio) / 2
+        fr = right_torque * (1 - right_ratio) / 2
+        rr = right_torque * (1 + right_ratio) / 2
+        
+        return np.array([fl, fr, rl, rr], dtype=np.float32)
+
     async def step(self, action):
         try:
             self.step_count += 1
-            data = struct.pack('dddd', *map(float, action))
+            torques = self.action_to_torques(action)
+            data = struct.pack('dddd', *map(float, torques))
             await self.loop.run_in_executor(None, self.client_sock.sendall, data)
 
             raw_data = await self.loop.run_in_executor(None, self.client_sock.recv, 24)
@@ -181,7 +210,8 @@ class CarMaker4WIDEnv(gym.Env):
                 reward += self.early_done_penalty
 
             print(f"[STEP] episode={self.episode_count} step={self.step_count}")
-            print(f"[ACTION] FL={action[0]:7.4f} | FR={action[1]:7.4f} | RL={action[2]:7.4f} | RR={action[3]:7.4f}")
+            print(f"[ACTION_RAW] demand={action[0]:7.4f} | left_ratio={action[1]:7.4f} | right_ratio={action[2]:7.4f}")
+            print(f"[TORQUES] FL={torques[0]:7.4f} | FR={torques[1]:7.4f} | RL={torques[2]:7.4f} | RR={torques[3]:7.4f}")
             print(
                 f"[REWARD] V_diff: {velocity_penalty:9.4f}"
                 f"| Effort: {effort_penalty:9.4f} | Total: {reward:9.4f}"
