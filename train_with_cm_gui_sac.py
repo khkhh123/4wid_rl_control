@@ -13,7 +13,7 @@ import cmapi
 
 # 액션 크기 및 바퀴 간 불균형 패널티 가중치
 ACTION_VELOCITY_WEIGHT = float(os.getenv("ACTION_VELOCITY_WEIGHT", "10.0"))
-ACTION_EFFORT_WEIGHT = float(os.getenv("ACTION_EFFORT_WEIGHT", "0.0"))
+ACTION_EFFORT_WEIGHT = float(os.getenv("ACTION_EFFORT_WEIGHT", "1"))
 ACTION_BALANCE_WEIGHT = 0.0  # balance penalty disabled
 
 
@@ -44,19 +44,17 @@ SAC_PRESETS = {
     },
     # 공격적: 환경 샘플당 업데이트 비율 증가
     "C": {
-        "learning_rate": 1e-3,
-        "buffer_size": 300000,
+        "learning_rate": 1.5e-4,
+        "buffer_size": 100000000,
         "learning_starts": 5000,
         "batch_size": 256,
         "tau": 0.005,
         "gamma": 0.99,
-        "train_freq": (128*64, "step"),
+        "train_freq": (128*32, "step"),
         "gradient_steps": 128,
         "ent_coef": "auto",
     }
 }
-
-
 
 class SaveBestEpisodeRewardCallback(BaseCallback):
     def __init__(self, best_model_path, verbose=1):
@@ -131,9 +129,10 @@ class CarMaker4WIDEnv(gym.Env):
         self.loop = loop
         self.client_sock = None
         self.last_obs = None
+        self.episode_count = 0
         self.step_count = 0
         self.max_steps = int(os.getenv("EPISODE_MAX_STEPS", "500"))
-        self.early_done_penalty = float(os.getenv("EARLY_DONE_PENALTY", "-10000.0"))
+        self.early_done_penalty = float(os.getenv("EARLY_DONE_PENALTY", "-1000000.0"))
 
         # 지휘자와 소통하기 위한 이벤트
         self.reset_req = asyncio.Event()
@@ -144,10 +143,12 @@ class CarMaker4WIDEnv(gym.Env):
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32)
 
     async def reset(self, seed=None, options=None):
+        self.episode_count += 1
         self.step_count = 0
         self.reset_req.set()
         await self.ready_evt.wait()
         self.ready_evt.clear()
+        print(f"[EPISODE] {self.episode_count} started")
         return np.array(self.last_obs, dtype=np.float32), {}
 
     async def step(self, action):
@@ -164,11 +165,14 @@ class CarMaker4WIDEnv(gym.Env):
             self.last_obs = [curr_v, v_diff]
 
             action = np.asarray(action, dtype=np.float32)
-            velocity_penalty = ACTION_VELOCITY_WEIGHT * float(v_diff**2) / 1600
-            effort_penalty = ACTION_EFFORT_WEIGHT * float(np.sum(action**2))
-            balance_penalty = 0.0
+            velocity_penalty = ACTION_VELOCITY_WEIGHT * np.exp(-float(v_diff**2) / 1600)
 
-            reward = - velocity_penalty - effort_penalty
+            effort_penalty = ACTION_EFFORT_WEIGHT * float(np.sum(action**2))
+            # weight_dist = 1.0 / (1.0 + np.exp(v_diff**2))
+            weight_dist = 1.0
+
+            reward = velocity_penalty - weight_dist * effort_penalty
+            # 지수형 보상 함수
             terminated = (sim_state != 8.0)
 
             # 조기 종료 패널티 적용
@@ -176,6 +180,7 @@ class CarMaker4WIDEnv(gym.Env):
                 print(f"[EARLY DONE] step={self.step_count} < max_steps={self.max_steps} → penalty {self.early_done_penalty}")
                 reward += self.early_done_penalty
 
+            print(f"[STEP] episode={self.episode_count} step={self.step_count}")
             print(f"[ACTION] FL={action[0]:7.4f} | FR={action[1]:7.4f} | RL={action[2]:7.4f} | RR={action[3]:7.4f}")
             print(
                 f"[REWARD] V_diff: {velocity_penalty:9.4f}"
@@ -243,26 +248,72 @@ class SyncBridge(gym.Env):
         pass
 
 
+def preload_replay_buffer_from_custom_data(model):
+    """Load custom controller transition files and push them into SAC replay buffer.
+
+    Expected transition format per item:
+    (obs, action, reward, next_obs, done)
+    """
+    data_glob = os.getenv("CUSTOM_DATA_GLOB", "custom_episode_*.npy")
+    data_files = sorted(Path(".").glob(data_glob))
+
+    if not data_files:
+        print(f"[REPLAY PRELOAD] No files found for pattern: {data_glob}")
+        return 0
+
+    loaded_count = 0
+    for file_path in data_files:
+        try:
+            arr = np.load(file_path, allow_pickle=True)
+            for item in arr:
+                obs, action, reward, next_obs, done = item
+
+                obs = np.asarray(obs, dtype=np.float32)
+                next_obs = np.asarray(next_obs, dtype=np.float32)
+                action = np.asarray(action, dtype=np.float32)
+                reward = float(reward)
+                done = bool(done)
+
+                model.replay_buffer.add(
+                    obs=np.array([obs], dtype=np.float32),
+                    next_obs=np.array([next_obs], dtype=np.float32),
+                    action=np.array([action], dtype=np.float32),
+                    reward=np.array([reward], dtype=np.float32),
+                    done=np.array([done], dtype=np.float32),
+                    infos=[{}],
+                )
+                loaded_count += 1
+        except Exception as e:
+            print(f"[REPLAY PRELOAD][WARN] Failed to load {file_path}: {e}")
+
+    print(f"[REPLAY PRELOAD] Loaded {loaded_count} transitions from {len(data_files)} file(s).")
+    return loaded_count
+
+
 def run_learning(env):
     profile = get_sac_profile()
     sac_kwargs = SAC_PRESETS[profile]
     model_path = f"carmaker_sac_4wid_gui_{profile}.zip"
-    best_model_path = f"carmaker_sac_4wid_gui_{profile}_best.zip"
+    best_model_path = f"carmaker_sac_4wid_gui_{profile}_best2.zip"
     interrupt_model_path = f"carmaker_sac_4wid_gui_{profile}_interrupt.zip"
     callback = SaveBestEpisodeRewardCallback(best_model_path)
 
     print(f"--- SAC 프로필: {profile} ---")
     print(f"--- SAC 설정: {sac_kwargs} ---")
 
-    if os.path.exists(best_model_path):
-        print(f"--- 기존 모델 '{best_model_path}'을(를) 불러와서 학습을 재개합니다. ---")
-        model = SAC.load(best_model_path, env=env, device="cpu", verbose=1)
-    # if os.path.exists(model_path):
-    #     print(f"--- 기존 모델 '{model_path}'을(를) 불러와서 학습을 재개합니다. ---")
-    #     model = SAC.load(model_path, env=env, device="cpu", verbose=1)
+    # if os.path.exists(best_model_path):
+    #     print(f"--- 기존 모델 '{best_model_path}'을(를) 불러와서 학습을 재개합니다. ---")
+    #     model = SAC.load(best_model_path, env=env, device="cpu", verbose=1)
+    if os.path.exists(model_path):
+        print(f"--- 기존 모델 '{model_path}'을(를) 불러와서 학습을 재개합니다. ---")
+        model = SAC.load(model_path, env=env, device="cpu", verbose=1)
     else:
         print("--- 기존 모델이 없습니다. 새로운 SAC 모델을 생성합니다. ---")
         model = SAC("MlpPolicy", env, verbose=1, device="cpu", **sac_kwargs)
+
+    preload_count = preload_replay_buffer_from_custom_data(model)
+    if preload_count > 0:
+        print(f"--- replay buffer 사전 주입 완료: {preload_count} transitions ---")
 
     try:
         model.learn(total_timesteps=1000000, callback=callback)
