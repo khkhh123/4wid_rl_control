@@ -199,7 +199,7 @@ async def carmaker_orchestrator(env, simcontrol, variation, server_sock):
         
         await simcontrol.start_sim()
         await simcontrol.create_simstate_condition(cmapi.ConditionSimState.running).wait()
-        
+        simcontrol.set_realtimefactor(100.0)
         # 소켓 연결 수락 및 초기화
         env.client_sock, _ = await loop.run_in_executor(None, server_sock.accept)
         raw_obs = await loop.run_in_executor(None, env.client_sock.recv, 24)
@@ -287,7 +287,8 @@ async def main():
     # master.set_sinfo(cmapi.ApoServerInfo(pid=get_carmaker_pid(), description="Idle"))
     # master.set_host("localhost")
     master = cmapi.CarMaker()
-    master.set_executable_path(project_path / "src/CarMaker_5555.linux64")
+    # master.set_executable_path(project_path / "src/CarMaker_5555.linux64")
+    master.set_executable_path(project_path / "src/CarMaker.linux64")
 
     simcontrol = cmapi.SimControlInteractive()
     await simcontrol.set_master(master)

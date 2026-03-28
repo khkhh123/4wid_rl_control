@@ -145,7 +145,7 @@ def get_ppo_profile(action_mode: str):
 
 
 def get_carmaker_pid():
-    target = "CarMaker.linux64"
+    target = "CarMaker_5555.linux64"
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             if target in proc.info["name"] or any(target in arg for arg in (proc.info["cmdline"] or [])):

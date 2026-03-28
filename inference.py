@@ -35,12 +35,12 @@ BASE_DIR = Path(__file__).resolve().parent
 
 ACTION_VELOCITY_WEIGHT = float(os.getenv("ACTION_VELOCITY_WEIGHT", "10"))
 ACTION_EFFORT_WEIGHT = float(os.getenv("ACTION_EFFORT_WEIGHT", "1.0"))
-DEFAULT_DEMAND_TORQUE = float(os.getenv("DEFAULT_DEMAND_TORQUE", "0.0"))
+DEFAULT_DEMAND_TORQUE = float(os.getenv("DEFAULT_DEMAND_TORQUE", "350.0"))
 WHEEL_TORQUE_LIMIT = float(os.getenv("WHEEL_TORQUE_LIMIT", "875.0"))
 
 
 def get_carmaker_pid():
-    target = "CarMaker"
+    target = "CarMaker_5555"
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
             name = proc.info.get("name") or ""

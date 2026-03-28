@@ -1,0 +1,12 @@
+# Python cache
+/__pycache__/
+*.py[cod]
+
+# Training artifacts
+/*.zip
+/*.zip.reward
+/*_checkpoint.zip
+
+# TensorBoard logs
+/ppo_carmaker_lefttorque_ratio3_tensorboard/
+/ppo_carmaker_action4_tensorboard/
