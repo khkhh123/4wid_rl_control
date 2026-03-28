@@ -14,12 +14,17 @@ from stable_baselines3.common.callbacks import BaseCallback
 from experiment_modes import (
     ACTION_MODE_RATIO3,
     ACTION_MODE_ACTION4,
+    RUN_MODE_GUI,
+    RUN_MODE_HEADLESS,
     REWARD_MODE_EFFORT_ONLY,
     REWARD_MODE_VELOCITY_EFFORT,
     resolve_action_mode,
     resolve_reward_mode,
     resolve_model_basename,
     resolve_tensorboard_dir,
+    resolve_env_id,
+    resolve_cm_port,
+    resolve_run_mode,
 )
 
 # CarMaker API 설정
@@ -32,7 +37,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 ACTION_VELOCITY_WEIGHT = float(os.getenv("ACTION_VELOCITY_WEIGHT", "10"))
 ACTION_EFFORT_WEIGHT = float(os.getenv("ACTION_EFFORT_WEIGHT", "1.0"))
-DEFAULT_DEMAND_TORQUE = float(os.getenv("DEFAULT_DEMAND_TORQUE", "200.0"))
+DEFAULT_DEMAND_TORQUE = float(os.getenv("DEFAULT_DEMAND_TORQUE", "500.0"))
 WHEEL_TORQUE_LIMIT = float(os.getenv("WHEEL_TORQUE_LIMIT", "875.0"))
 
 
@@ -57,7 +62,7 @@ PPO_PRESETS = {
             "batch_size": 512,
             "gamma": 0.99,
             "n_steps": 2048,
-            "ent_coef": 0.0,
+            "ent_coef": 0.2,
         },
     },
     ACTION_MODE_ACTION4: {
@@ -148,6 +153,22 @@ def get_carmaker_pid():
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return None
+
+
+def build_master(run_mode: str, project_path: Path):
+    if run_mode == RUN_MODE_HEADLESS:
+        master = cmapi.CarMaker()
+        executable_path = Path(os.getenv("CM_EXECUTABLE_PATH", str(project_path / "src/CarMaker.linux64")))
+        master.set_executable_path(executable_path)
+        return master
+
+    pid = get_carmaker_pid()
+    if pid is None:
+        raise RuntimeError("실행 중인 CarMaker GUI 프로세스를 찾지 못했습니다.")
+    master = cmapi.ApoServer()
+    master.set_sinfo(cmapi.ApoServerInfo(pid=pid, description="Idle"))
+    master.set_host("localhost")
+    return master
 
 
 class CarMaker4WIDEnv(gym.Env):
@@ -378,10 +399,15 @@ def run_learning(env, action_mode: str):
 async def main():
     action_mode = resolve_action_mode()
     reward_mode = resolve_reward_mode(action_mode)
+    run_mode = resolve_run_mode()
     testrun_name = os.getenv("TESTRUN_NAME", "testrun_test1")
-    port = int(os.getenv("CM_PORT", "5555"))
+    env_id = resolve_env_id()
+    port = resolve_cm_port()
 
-    print(f"[CONFIG] ACTION_MODE={action_mode} | REWARD_MODE={reward_mode} | TESTRUN={testrun_name}")
+    print(
+        f"[CONFIG] ACTION_MODE={action_mode} | REWARD_MODE={reward_mode}"
+        f" | RUN_MODE={run_mode} | TESTRUN={testrun_name} | ENV_ID={env_id} | CM_PORT={port}"
+    )
 
     proj_path = Path("/home/khkhh/CM_Projects/test1")
     cmapi.Project.load(proj_path)
@@ -391,9 +417,7 @@ async def main():
     server_sock.bind(("127.0.0.1", port))
     server_sock.listen(1)
 
-    master = cmapi.ApoServer()
-    master.set_sinfo(cmapi.ApoServerInfo(pid=get_carmaker_pid(), description="Idle"))
-    master.set_host("localhost")
+    master = build_master(run_mode, proj_path)
 
     simcontrol = cmapi.SimControlInteractive()
     await simcontrol.set_master(master)
