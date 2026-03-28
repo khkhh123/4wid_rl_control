@@ -12,22 +12,22 @@ sys.path.append("/opt/ipg/carmaker/linux64-14.0.1/Python/python3.10")
 import cmapi
 
 # 액션 크기 및 바퀴 간 불균형 패널티 가중치
-ACTION_VELOCITY_WEIGHT = float(os.getenv("ACTION_VELOCITY_WEIGHT", "10.0"))
-ACTION_EFFORT_WEIGHT = float(os.getenv("ACTION_EFFORT_WEIGHT", "0.0"))
+ACTION_VELOCITY_WEIGHT = float(os.getenv("ACTION_VELOCITY_WEIGHT", "10"))
+ACTION_EFFORT_WEIGHT = float(os.getenv("ACTION_EFFORT_WEIGHT", "1.0"))
 ACTION_BALANCE_WEIGHT = 0.0  # balance penalty disabled
 
 
 SAC_PRESETS = {
     # 보수적: 안정성 우선
     "A": {
-        "learning_rate": 1e-4,
-        "buffer_size": 200000,
-        "learning_starts": 10000,
+        "learning_rate": 1e-5,
+        "buffer_size": 300000,
+        "learning_starts": 5000,
         "batch_size": 256,
         "tau": 0.005,
         "gamma": 0.99,
-        "train_freq": (64, "step"),
-        "gradient_steps": 64,
+        "train_freq": (8192, "step"),
+        "gradient_steps": 128,
         "ent_coef": "auto_0.1",
     },
     # 기본: 균형형
@@ -133,7 +133,7 @@ class CarMaker4WIDEnv(gym.Env):
         self.last_obs = None
         self.step_count = 0
         self.max_steps = int(os.getenv("EPISODE_MAX_STEPS", "500"))
-        self.early_done_penalty = float(os.getenv("EARLY_DONE_PENALTY", "-10000.0"))
+        self.early_done_penalty = float(os.getenv("EARLY_DONE_PENALTY", "-50.0"))
 
         # 지휘자와 소통하기 위한 이벤트
         self.reset_req = asyncio.Event()
@@ -248,24 +248,25 @@ def run_learning(env):
     sac_kwargs = SAC_PRESETS[profile]
     model_path = f"carmaker_sac_4wid_gui_{profile}.zip"
     best_model_path = f"carmaker_sac_4wid_gui_{profile}_best.zip"
+    checkpoint_model_path = f"carmaker_sac_4wid_gui_C_spd_checkpoint.zip"
     interrupt_model_path = f"carmaker_sac_4wid_gui_{profile}_interrupt.zip"
     callback = SaveBestEpisodeRewardCallback(best_model_path)
 
     print(f"--- SAC 프로필: {profile} ---")
     print(f"--- SAC 설정: {sac_kwargs} ---")
 
-    if os.path.exists(best_model_path):
-        print(f"--- 기존 모델 '{best_model_path}'을(를) 불러와서 학습을 재개합니다. ---")
-        model = SAC.load(best_model_path, env=env, device="cpu", verbose=1)
-    # if os.path.exists(model_path):
-    #     print(f"--- 기존 모델 '{model_path}'을(를) 불러와서 학습을 재개합니다. ---")
-    #     model = SAC.load(model_path, env=env, device="cpu", verbose=1)
+    # if os.path.exists(checkpoint_model_path):
+    #     print(f"--- 기존 모델 '{checkpoint_model_path}'을(를) 불러와서 학습을 재개합니다. ---")
+    #     model = SAC.load(checkpoint_model_path, env=env, device="cpu", verbose=1)
+    if os.path.exists(model_path):
+        print(f"--- 기존 모델 '{model_path}'을(를) 불러와서 학습을 재개합니다. ---")
+        model = SAC.load(model_path, env=env, device="cpu", verbose=1)
     else:
         print("--- 기존 모델이 없습니다. 새로운 SAC 모델을 생성합니다. ---")
         model = SAC("MlpPolicy", env, verbose=1, device="cpu", **sac_kwargs)
 
     try:
-        model.learn(total_timesteps=1000000, callback=callback)
+        model.learn(total_timesteps=100000, callback=callback)
     except KeyboardInterrupt:
         print("학습 중단 요청됨. 모델 저장 중...")
         model.save(interrupt_model_path)

@@ -12,12 +12,60 @@ sys.path.append("/opt/ipg/carmaker/linux64-14.0.1/Python/python3.10")
 import cmapi
 
 
+# 액션 크기 및 보상 가중치 (SAC 스크립트와 동일한 보상 구성)
+ACTION_VELOCITY_WEIGHT = float(os.getenv("ACTION_VELOCITY_WEIGHT", "10"))
+ACTION_EFFORT_WEIGHT = float(os.getenv("ACTION_EFFORT_WEIGHT", "1.0"))
+
+
+PPO_PRESETS = {
+    # 보수적: 안정성 우선
+    "A": {
+        "learning_rate": 1e-5,
+        "batch_size": 256,
+        "gamma": 0.99,
+        "n_steps": 8192,
+        "ent_coef": 0.1,
+    },
+    # 기본: 균형형
+    "B": {
+        "learning_rate": 3e-4,
+        "batch_size": 256,
+        "gamma": 0.99,
+        "n_steps": 4096,
+        "ent_coef": 0.0,
+    },
+    # 공격적: 빠른 학습률
+    "C": {
+        "learning_rate": 1e-3,
+        "batch_size": 256,
+        "gamma": 0.99,
+        "n_steps": 8192,
+        "ent_coef": 0.0,
+    },
+}
+
+
 class SaveBestEpisodeRewardCallback(BaseCallback):
     def __init__(self, best_model_path, verbose=1):
         super().__init__(verbose)
         self.best_model_path = best_model_path
+        self.best_reward_path = best_model_path + ".reward"
         self.current_episode_reward = 0.0
         self.best_episode_reward = -np.inf
+        if os.path.exists(self.best_reward_path):
+            try:
+                with open(self.best_reward_path, "r") as f:
+                    self.best_episode_reward = float(f.read().strip())
+            except Exception:
+                self.best_episode_reward = -np.inf
+
+    def _save_best_reward(self):
+        try:
+            with open(self.best_reward_path, "w") as f:
+                f.write(str(self.best_episode_reward))
+        except Exception as e:
+            if self.verbose:
+                print(f"[WARN] Failed to save best reward: {e}")
 
     def _on_step(self) -> bool:
         rewards = self.locals.get("rewards")
@@ -30,10 +78,24 @@ class SaveBestEpisodeRewardCallback(BaseCallback):
             if self.current_episode_reward > self.best_episode_reward:
                 self.best_episode_reward = self.current_episode_reward
                 self.model.save(self.best_model_path)
+                self._save_best_reward()
                 if self.verbose:
                     print(f"[BEST] episode_reward={self.best_episode_reward:.3f} -> {self.best_model_path}")
             self.current_episode_reward = 0.0
         return True
+
+
+def get_ppo_profile():
+    # 우선순위: 환경변수 > CLI 인자 > 기본값(B)
+    profile = os.getenv("PPO_PROFILE")
+    if not profile and len(sys.argv) > 1:
+        profile = sys.argv[1]
+
+    profile = (profile or "B").upper()
+    if profile not in PPO_PRESETS:
+        print(f"알 수 없는 프로필 '{profile}' 입니다. B 프로필로 진행합니다. (사용 가능: A/B/C)")
+        profile = "B"
+    return profile
 
 def get_carmaker_pid():
     target = "CarMaker.linux64"
@@ -51,6 +113,9 @@ class CarMaker4WIDEnv(gym.Env):
         self.loop = loop
         self.client_sock = None
         self.last_obs = None
+        self.step_count = 0
+        self.max_steps = int(os.getenv("EPISODE_MAX_STEPS", "500"))
+        self.early_done_penalty = float(os.getenv("EARLY_DONE_PENALTY", "-50.0"))
         
         # 지휘자와 소통하기 위한 이벤트
         self.reset_req = asyncio.Event()
@@ -62,6 +127,7 @@ class CarMaker4WIDEnv(gym.Env):
 
     async def reset(self, seed=None, options=None):
         # 지휘자에게 리셋 요청 후 준비될 때까지 대기
+        self.step_count = 0
         self.reset_req.set()
         await self.ready_evt.wait()
         self.ready_evt.clear()
@@ -70,6 +136,7 @@ class CarMaker4WIDEnv(gym.Env):
     async def step(self, action):
         # 기존 step 로직: 소켓을 통해 데이터 주고받기
         try:
+            self.step_count += 1
             # 액션 전송
             data = struct.pack('dddd', *map(float, action))
             await self.loop.run_in_executor(None, self.client_sock.sendall, data)
@@ -81,9 +148,23 @@ class CarMaker4WIDEnv(gym.Env):
 
             curr_v, v_diff, sim_state = struct.unpack('ddd', raw_data)
             self.last_obs = [curr_v, v_diff]
-            
-            reward = -float(v_diff**2) - 0.1 * np.sum(action**2)
+
+            action = np.asarray(action, dtype=np.float32)
+            velocity_penalty = ACTION_VELOCITY_WEIGHT * float(v_diff**2) / 1600
+            effort_penalty = ACTION_EFFORT_WEIGHT * float(np.sum(action**2))
+            reward = -velocity_penalty - effort_penalty
             terminated = (sim_state != 8.0)
+
+            # 조기 종료 패널티 적용
+            if terminated and self.step_count < self.max_steps:
+                print(f"[EARLY DONE] step={self.step_count} < max_steps={self.max_steps} -> penalty {self.early_done_penalty}")
+                reward += self.early_done_penalty
+
+            print(f"[ACTION] FL={action[0]:7.4f} | FR={action[1]:7.4f} | RL={action[2]:7.4f} | RR={action[3]:7.4f}")
+            print(
+                f"[REWARD] V_diff: {velocity_penalty:9.4f}"
+                f"| Effort: {effort_penalty:9.4f} | Total: {reward:9.4f}"
+            )
             
             return np.array(self.last_obs, dtype=np.float32), reward, terminated, False, {}
         except Exception as e:
@@ -150,10 +231,16 @@ class SyncBridge(gym.Env):
     def close(self):           pass
 
 def run_learning(env):
+    profile = get_ppo_profile()
+    ppo_kwargs = PPO_PRESETS[profile]
+
     model_path = "carmaker_ppo_4wid1.zip"
     best_model_path = "carmaker_ppo_4wid1_best.zip"
     interrupt_model_path = "carmaker_ppo_4wid1_interrupt.zip"
     callback = SaveBestEpisodeRewardCallback(best_model_path)
+
+    print(f"--- PPO 프로필: {profile} ---")
+    print(f"--- PPO 설정: {ppo_kwargs} ---")
 
     # 1. 기존 모델이 있는지 확인
     if os.path.exists(model_path):
@@ -163,7 +250,14 @@ def run_learning(env):
     else:
         print("--- 기존 모델이 없습니다. 새로운 모델을 생성합니다. ---")
         # 새로 시작할 경우
-        model = PPO("MlpPolicy", env, verbose=1, device="cpu")
+        model = PPO("MlpPolicy", env, verbose=1, device="cpu", **ppo_kwargs)
+
+    # 로드된 모델에도 프로필 설정을 동일하게 적용
+    model.n_steps = ppo_kwargs["n_steps"]
+    model.batch_size = ppo_kwargs["batch_size"]
+    model.gamma = ppo_kwargs["gamma"]
+    model.learning_rate = ppo_kwargs["learning_rate"]
+    model.ent_coef = ppo_kwargs["ent_coef"]
 
     try:
         model.learn(total_timesteps=10000000, callback=callback)

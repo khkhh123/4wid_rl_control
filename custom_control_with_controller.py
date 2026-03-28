@@ -11,10 +11,12 @@ sys.path.append("/opt/ipg/carmaker/linux64-14.0.1/Python/python3.10")
 import cmapi
 
 def get_carmaker_pid():
-    target = "CarMaker_5555.linux64"
+    targets = ("CarMaker_5555.linux64", "CarMaker.linux64")
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
-            if target in proc.info['name'] or any(target in arg for arg in (proc.info['cmdline'] or [])):
+            name = proc.info.get('name') or ""
+            cmdline = proc.info.get('cmdline') or []
+            if any(t in name or any(t in arg for arg in cmdline) for t in targets):
                 return proc.info['pid']
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -82,7 +84,9 @@ class CarMaker4WIDEnv(gym.Env):
             if terminated and self.step_count < self.max_steps:
                 reward += self.early_done_penalty
             return np.array(self.last_obs, dtype=np.float32), reward, terminated, False, {}
-        except Exception:
+        except Exception as e:
+            # 디버깅을 위해 예외를 출력해 즉시 원인을 확인할 수 있도록 한다.
+            print(f"[STEP ERROR] {type(e).__name__}: {e}")
             return np.zeros(2), 0, True, False, {}
 
 async def carmaker_orchestrator(env, simcontrol, variation, server_sock):
@@ -149,7 +153,10 @@ def example_controller(obs):
     # 예시: 단순히 v_diff를 줄이기 위한 proportional control
     curr_v, v_diff = obs
     kp = 1000
-    action = np.ones(4, dtype=np.float32) * (kp * v_diff)/3000
+    demand_ratio = np.clip((kp * v_diff) / 3000, -1.0, 1.0)
+    left_ratio = 0.0
+    right_ratio = 0.0
+    action = np.array([demand_ratio, left_ratio, right_ratio], dtype=np.float32)
     return np.clip(action, -1, 1)
 
 async def main():
@@ -173,7 +180,6 @@ async def main():
     await loop.run_in_executor(None, run_custom_control, env_sync, 3)  # 3 에피소드 예시
     print("Custom control finished. Sending stop signal to orchestrator...")
     env_async.stop_req.set()
-    loop.stop()
 
 if __name__ == "__main__":
     cmapi.Task.run_main_task(main())

@@ -18,21 +18,21 @@ ACTION_BALANCE_WEIGHT = 0.0  # balance penalty disabled
 
 
 SAC_PRESETS = {
-    # 보수적: 안정성 우선
+    # 보수적: 안정성 우선ACTION_EFFORT_WEIGHT
     "A": {
-        "learning_rate": 1e-4,
-        "buffer_size": 200000,
-        "learning_starts": 10000,
+        "learning_rate": 1e-5,
+        "buffer_size": 100000000,
+        "learning_starts": 5000,
         "batch_size": 256,
         "tau": 0.005,
         "gamma": 0.99,
-        "train_freq": (64, "step"),
+        "train_freq": (128*32, "step"),
         "gradient_steps": 64,
-        "ent_coef": "auto_0.1",
+        "ent_coef": "auto_0.05",
     },
     # 기본: 균형형
     "B": {
-        "learning_rate": 3e-4,
+        "learning_rate": 1e-4,
         "buffer_size": 200000,
         "learning_starts": 5000,
         "batch_size": 256,
@@ -335,8 +335,8 @@ def run_learning(env):
     #     print(f"--- 기존 모델 '{best_model_path}'을(를) 불러와서 학습을 재개합니다. ---")
     #     model = SAC.load(best_model_path, env=env, device="cpu", verbose=1)
     if os.path.exists(model_path):
-        print(f"--- 기존 모델 '{model_path}'을(를) 불러와서 학습을 재개합니다. ---")
-        model = SAC.load(model_path, env=env, device="cpu", verbose=1)
+        print(f"--- 기존 모델 '{model_path}'을(를) 불러와서 학습을 재개합니다. (preset {profile}하이퍼파라미터 적용) ---")
+        model = SAC.load(model_path, env=env, device="cpu", verbose=1, **sac_kwargs)
     else:
         print("--- 기존 모델이 없습니다. 새로운 SAC 모델을 생성합니다. ---")
         model = SAC("MlpPolicy", env, verbose=1, device="cpu", **sac_kwargs)
