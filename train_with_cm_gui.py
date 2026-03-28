@@ -46,11 +46,11 @@ PPO_PRESETS = {
             "ent_coef": 0.0,
         },
         "B": {
-            "learning_rate": 5e-4,
+            "learning_rate": 3e-4,
             "batch_size": 512,
             "gamma": 0.99,
             "n_steps": 2048,
-            "ent_coef": 0.1,
+            "ent_coef": 0.01,
         },
         "C": {
             "learning_rate": 1e-3,

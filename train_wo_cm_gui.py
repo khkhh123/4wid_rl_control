@@ -12,7 +12,7 @@ sys.path.append("/opt/ipg/carmaker/linux64-14.0.1/Python/python3.10")
 import cmapi
 
 
-# 액션 크기 및 보상 가중치 (SAC 스크립트와 동일한 보상 구성)
+# 액션 크기 및 보상 가중치
 ACTION_VELOCITY_WEIGHT = float(os.getenv("ACTION_VELOCITY_WEIGHT", "10"))
 ACTION_EFFORT_WEIGHT = float(os.getenv("ACTION_EFFORT_WEIGHT", "1.0"))
 

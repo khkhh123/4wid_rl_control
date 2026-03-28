@@ -4,7 +4,6 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from pathlib import Path
-from stable_baselines3 import SAC
 
 # CarMaker API 설정
 sys.path.append("/opt/ipg/carmaker/linux64-14.0.1/Python/python3.10")
