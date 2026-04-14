@@ -7,6 +7,8 @@ ACTION_MODE_ACTION4 = "action4"
 RUN_MODE_GUI = "gui"
 RUN_MODE_HEADLESS = "headless"
 
+PROTOCOL_MODE_ASSESSMENT23 = "assessment23"
+
 REWARD_MODE_EFFORT_ONLY = "effort_only"
 REWARD_MODE_VELOCITY_EFFORT = "velocity_effort"
 
@@ -36,8 +38,8 @@ def resolve_reward_mode(action_mode: str) -> str:
 
 def default_model_basename(action_mode: str) -> str:
     if action_mode == ACTION_MODE_ACTION4:
-        return "carmaker_ppo_4wid_action4"
-    return "carmaker_ppo_4wid_lefttorque_ratio3"
+        return "carmaker_ppo_4wid_action4_dyc"
+    return "carmaker_ppo_4wid_dyc"
 
 
 def resolve_model_basename(action_mode: str) -> str:
@@ -91,6 +93,29 @@ def resolve_run_mode() -> str:
         print(f"[WARN] Unknown CM_RUN_MODE='{mode}'. Fallback to '{RUN_MODE_GUI}'.")
         return RUN_MODE_GUI
     return mode
+
+
+def resolve_protocol_mode() -> str:
+    mode = os.getenv("CM_PROTOCOL_MODE", PROTOCOL_MODE_ASSESSMENT23).strip().lower()
+    if mode != PROTOCOL_MODE_ASSESSMENT23:
+        print(
+            f"[WARN] CM_PROTOCOL_MODE='{mode}' is ignored. "
+            f"Protocol is fixed to '{PROTOCOL_MODE_ASSESSMENT23}'."
+        )
+    return PROTOCOL_MODE_ASSESSMENT23
+
+
+def resolve_control_dt(default_value: float = 0.05) -> float:
+    raw = os.getenv("CONTROL_DT", str(default_value)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"[WARN] Invalid CONTROL_DT='{raw}'. Fallback to {default_value}.")
+        return default_value
+    if value <= 0.0:
+        print(f"[WARN] CONTROL_DT must be > 0. Fallback to {default_value}.")
+        return default_value
+    return value
 
 
 def resolve_num_workers(default_value: int = 1) -> int:

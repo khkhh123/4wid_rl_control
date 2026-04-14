@@ -261,13 +261,13 @@ def run_inference(env, action_mode: str):
 
 
 async def main():
-    project_path = Path("/home/khkhh/CM_Projects/test1")
+    project_path = Path("/home/khkhh/CM_Projects/assessment_of_4wid_ver14")
     cmapi.Project.load(project_path)
 
     action_mode = resolve_action_mode()
     reward_mode = resolve_reward_mode(action_mode)
     run_mode = resolve_run_mode()
-    testrun_name = os.getenv("TESTRUN_NAME", "testrun_test1")
+    testrun_name = os.getenv("TESTRUN_NAME", "test1")
     env_id = resolve_env_id()
     port = resolve_cm_port()
 

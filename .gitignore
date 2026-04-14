@@ -10,3 +10,10 @@
 # TensorBoard logs
 /ppo_carmaker_lefttorque_ratio3_tensorboard/
 /ppo_carmaker_action4_tensorboard/
+/carmaker_ppo_4wid_dyc_tensorboard/
+/carmaker_sac_4wid_dyc_tensorboard/
+/carmaker_td3_4wid_dyc_tensorboard/
+/legacy/ppo_carmaker_lefttorque_ratio3_tensorboard/
+/legacy/ppo_carmaker_lefttorque_ratio3_tensorboard_w0/
+/scenarios/
+/telemetry/
