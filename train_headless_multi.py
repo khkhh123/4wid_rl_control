@@ -32,7 +32,6 @@ from experiment_modes import RUN_MODE_HEADLESS
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
-
 class SaveBestEpisodeRewardVecCallback(BaseCallback):
     def __init__(self, best_model_path: str, latest_model_path: str, n_envs: int, verbose: int = 1):
         super().__init__(verbose)
@@ -449,8 +448,8 @@ def build_worker_env(worker_id: int):
     # Default: isolate each worker's model/log files to avoid write races.
     model_mode = env.setdefault("MULTI_MODEL_MODE", "per_worker").strip().lower()
     if model_mode == "per_worker":
-        base = os.getenv("MODEL_BASENAME", "carmaker_ppo_4wid_dyc")
-        tb = os.getenv("TB_DIRNAME", "ppo_carmaker_lefttorque_ratio3_tensorboard")
+        base = os.getenv("MODEL_BASENAME", "carmaker_sac_4wid_dyc")
+        tb = os.getenv("TB_DIRNAME", "carmaker_sac_4wid_dyc_tensorboard")
         env.setdefault("MODEL_BASENAME", f"{base}_w{worker_id}")
         env.setdefault("TB_DIRNAME", f"{tb}_w{worker_id}")
 

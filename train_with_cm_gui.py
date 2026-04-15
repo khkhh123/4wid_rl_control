@@ -700,7 +700,7 @@ class CarMaker4WIDEnv(gym.Env):
 		half_demand_trq = 0.5 * float(total_torque)
 		lr_offset_max = WHEEL_TORQUE_LIMIT * 2.0
 		lr_offset = left_total_bias * lr_offset_max
-		print(half_demand_trq)
+		# print(half_demand_trq)
 		left_total = half_demand_trq + lr_offset
 		right_total = half_demand_trq - lr_offset
 
@@ -744,12 +744,13 @@ class CarMaker4WIDEnv(gym.Env):
 		self.last_steering_cmd = 0.0
 		self.last_yaw_rate_sq_error = 0.0
 		self.speed_controller.reset()
-		if self.current_scenario_path is None or self._scenario_finished():
-			self._advance_scenario()
+		# if self.current_scenario_path is None or self._scenario_finished():
+			
 
 		if self.client_sock is None:
 			# 활성 연결 없음 -> 오케스트레이터에 새 시뮬레이션 요청
 			print("[ENV] No active connection. Requesting new simulation...")
+			self._advance_scenario()
 			self.reset_req.set()
 			await self.ready_evt.wait()
 			self.ready_evt.clear()
@@ -799,7 +800,7 @@ class CarMaker4WIDEnv(gym.Env):
 			yaw_rate_sq_error = float((actual_yaw_rate - ref_yaw_rate) ** 2)
 			self.last_yaw_rate_sq_error = yaw_rate_sq_error
 			obs[-1] = yaw_rate_sq_error
-			print(actual_yaw_rate - ref_yaw_rate)
+			# print(actual_yaw_rate - ref_yaw_rate)
 			yaw_rate_den = max(abs(float(ref_yaw_rate)), YAW_RATE_NORM_EPS)
 			yaw_rate_norm_error = (actual_yaw_rate - ref_yaw_rate) / yaw_rate_den
 			yaw_rate_err_penalty = YAW_RATE_WEIGHT * (yaw_rate_norm_error ** 2)
@@ -903,7 +904,7 @@ async def carmaker_orchestrator(env, simcontrol, variation, server_sock):
 			env.client_sock.close()
 			env.client_sock = None
 		print("[Orchestrator] Episode Finished & Cleaned up.")
-		await simcontrol.stop_sim()
+		await simcontrol.disconnect()
 
 class SyncBridge(gym.Env):
 	def __init__(self, a_env, loop):
