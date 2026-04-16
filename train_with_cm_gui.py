@@ -42,6 +42,8 @@ from carmaker_utils import (  # noqa: E402
     SaveBestEpisodeRewardCallback,
     SyncBridge,
     carmaker_orchestrator,
+    MotorMap,
+    compute_batt_net_power,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -50,6 +52,7 @@ from carmaker_utils import (  # noqa: E402
 YAW_RATE_WEIGHT          = float(os.getenv("YAW_RATE_WEIGHT",          "1e+2"))
 ACTION_EFFORT_WEIGHT     = float(os.getenv("ACTION_EFFORT_WEIGHT",     "1e-0"))
 SATURATION_PENALTY_WEIGHT = float(os.getenv("SATURATION_PENALTY_WEIGHT", "1e-2"))
+ENERGY_LOSS_WEIGHT       = float(os.getenv("ENERGY_LOSS_WEIGHT",       "1e-5"))
 YAW_RATE_NORM_EPS        = float(os.getenv("YAW_RATE_NORM_EPS",        "0.01"))
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +102,7 @@ SAC_PRESETS = {
     },
     "C": {
         "learning_rate": 3e-4, "batch_size": 512,  "gamma": 0.995,  "ent_coef": "auto",
-        "tau": 0.01,  "buffer_size": 1000000, "learning_starts": 5000,
+        "tau": 0.01,  "buffer_size": 1500000, "learning_starts": 5000,
         "train_freq": (1, "step"), "gradient_steps": 4, "policy_kwargs": {"net_arch": [256, 256, 256]},
     },
 }
@@ -205,6 +208,10 @@ class CarMaker4WIDEnv(gym.Env):
         # 제어기
         self.speed_controller   = PISpeedController()
         self.stanley_controller = StanleySteeringController()
+        mg_map_path = os.getenv("MG_MAP_PATH", str(Path(__file__).resolve().parent / "scaled_mg_map.mat"))
+        self.motor_map = MotorMap(Path(mg_map_path))
+        self.motor_map.load()
+        self.last_rotv = np.zeros(4, dtype=np.float64)
 
         # 시나리오
         self.base_dir          = Path(__file__).resolve().parent
@@ -253,12 +260,13 @@ class CarMaker4WIDEnv(gym.Env):
         ref_yaw_rate: float,
         wheel_torques: np.ndarray,
         wheel_saturation_penalty: float,
+        batt_net_power_w: float = 0.0,
     ):
         """
         ════════════════════════════════════════════════
         보상 함수  ◀  수정 포인트
         ════════════════════════════════════════════════
-        반환: (reward, yaw_penalty, effort_penalty, saturation_penalty)
+        반환: (reward, yaw_penalty, effort_penalty, saturation_penalty, energy_penalty)
         """
         # actual과 ref 중 큰 쪽으로 정규화:
         #   직진(ref≈0, actual 작음) → actual이 분모 → 작은 모멘트도 엄격하게 패널티
@@ -267,8 +275,9 @@ class CarMaker4WIDEnv(gym.Env):
         yaw_penalty        = YAW_RATE_WEIGHT * ((actual_yaw_rate - ref_yaw_rate) / yaw_den) ** 2
         effort_penalty     = ACTION_EFFORT_WEIGHT * float(np.sum((wheel_torques / WHEEL_TORQUE_LIMIT) ** 2))
         sat_penalty        = SATURATION_PENALTY_WEIGHT * wheel_saturation_penalty
-        reward = -(yaw_penalty + effort_penalty + sat_penalty)
-        return reward, yaw_penalty, effort_penalty, sat_penalty
+        energy_penalty     = ENERGY_LOSS_WEIGHT * float(batt_net_power_w)
+        reward = -(yaw_penalty + effort_penalty + sat_penalty + energy_penalty)
+        return reward, yaw_penalty, effort_penalty, sat_penalty, energy_penalty
 
     # ── 시나리오 관리 ──────────────────────────────────────────────────────────
 
@@ -370,6 +379,7 @@ class CarMaker4WIDEnv(gym.Env):
         self.curr_speed_mps = speed_mps
         ax = float(state[21])
         ay = float(state[22])
+        self.last_rotv = np.array(state[4:8], dtype=np.float64)
         obs = [speed_mps * 3.6, yaw_rate, ax, ay]
         return state, obs
 
@@ -441,12 +451,14 @@ class CarMaker4WIDEnv(gym.Env):
             "yaw_penalty":        float(self.episode_yaw_penalty_sum),
             "effort_penalty":     float(self.episode_effort_penalty_sum),
             "saturation_penalty": float(self.episode_saturation_penalty_sum),
+            "energy_penalty":     float(self.episode_energy_penalty_sum),
             "episode": {
                 "r":                  float(self.episode_reward_sum),
                 "l":                  int(self.step_count),
                 "yaw_penalty":        float(self.episode_yaw_penalty_sum),
                 "effort_penalty":     float(self.episode_effort_penalty_sum),
                 "saturation_penalty": float(self.episode_saturation_penalty_sum),
+                "energy_penalty":     float(self.episode_energy_penalty_sum),
             },
         }
 
@@ -459,6 +471,7 @@ class CarMaker4WIDEnv(gym.Env):
         self.episode_yaw_penalty_sum      = 0.0
         self.episode_effort_penalty_sum   = 0.0
         self.episode_saturation_penalty_sum = 0.0
+        self.episode_energy_penalty_sum   = 0.0
         self.prev_yaw                     = None
         self.last_total_torque            = 0.0
         self.last_steering_cmd            = 0.0
@@ -523,8 +536,9 @@ class CarMaker4WIDEnv(gym.Env):
             obs.append(yaw_rate_sq_error)
             self.last_obs = obs
 
-            reward, yaw_pen, effort_pen, sat_pen = self._compute_reward(
-                actual_yaw_rate, ref_yaw_rate, wheel_torques, wheel_saturation_penalty
+            batt_net_power_w = compute_batt_net_power(wheel_torques, self.last_rotv, self.motor_map)
+            reward, yaw_pen, effort_pen, sat_pen, energy_pen = self._compute_reward(
+                actual_yaw_rate, ref_yaw_rate, wheel_torques, wheel_saturation_penalty, batt_net_power_w
             )
 
             terminated = False  # 시뮬 상태는 소켓 끊김으로만 감지
@@ -535,6 +549,7 @@ class CarMaker4WIDEnv(gym.Env):
             self.episode_yaw_penalty_sum        += float(yaw_pen)
             self.episode_effort_penalty_sum     += float(effort_pen)
             self.episode_saturation_penalty_sum += float(sat_pen)
+            self.episode_energy_penalty_sum     += float(energy_pen)
 
             info = self._make_episode_info() if done else {}
             return np.array(self.last_obs, dtype=np.float32), reward, terminated, truncated, info
@@ -560,7 +575,7 @@ class CarMaker4WIDEnv(gym.Env):
                     self.last_action_info.get("torque_rl", 0.0),
                     self.last_action_info.get("torque_rr", 0.0),
                 ], dtype=np.float32)
-                step_r, _, _, _ = self._compute_reward(actual_yaw_rate, ref_yaw_rate_ex, torques_ex, 0.0)
+                step_r, _, _, _, _ = self._compute_reward(actual_yaw_rate, ref_yaw_rate_ex, torques_ex, 0.0)
                 reward = step_r + self.early_done_penalty
                 terminated, truncated = True, False
                 print(f"[STEP] 조기 중단 패널티 적용: {reward:.1f}")
@@ -589,11 +604,124 @@ def get_ppo_profile():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 리플레이 버퍼 시딩 (algo2/algo3 CSV → SAC/TD3 버퍼)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def seed_replay_buffer_from_csv(model, rb_dir: str) -> int:
+    """
+    output/rb/ 의 algo2/algo3 CSV를 읽어 replay buffer에 직접 주입.
+    환경변수 RB_SEED_DIR 로 활성화. SAC/TD3 전용.
+    steering_cmd 컬럼 없는 구버전 파일은 자동 스킵.
+    """
+    import glob
+    import pandas as pd
+
+    files = sorted(
+        glob.glob(os.path.join(rb_dir, "*_algo2_*.csv")) +
+        glob.glob(os.path.join(rb_dir, "*_algo3_*.csv"))
+    )
+    if not files:
+        print(f"[SEED] algo2/algo3 CSV 없음: {rb_dir}")
+        return 0
+
+    all_obs, all_nxt, all_act, all_rew, all_don = [], [], [], [], []
+
+    for fpath in files:
+        df = pd.read_csv(fpath)
+        if "steering_cmd" not in df.columns:
+            print(f"[SEED] steering_cmd 없음 (구버전), 스킵: {os.path.basename(fpath)}")
+            continue
+        if len(df) < 2:
+            continue
+
+        # ── obs ─────────────────────────────────────────────────────────────
+        total_torque = (df["sat_drive_torque_total_nm"].values
+                        - df["sat_regen_torque_total_nm"].values)
+        yaw_rate = df["veh_yaw_rate"].values
+        ref_yr   = df["ref_yaw_rate"].values
+        obs = np.column_stack([
+            df["veh_speed"].values * 3.6,       # speed_kph
+            yaw_rate,                            # yaw_rate
+            df["veh_ax"].values,                 # ax
+            df["veh_ay"].values,                 # ay
+            total_torque,                        # total_torque
+            df["steering_cmd"].values,           # steering_cmd
+            (yaw_rate - ref_yr) ** 2,            # yaw_rate_sq_error
+        ]).astype(np.float32)
+
+        # ── action 역산 ──────────────────────────────────────────────────────
+        fl = df["torque_fl"].values
+        fr = df["torque_fr"].values
+        rl = df["torque_rl"].values
+        rr = df["torque_rr"].values
+        lt = fl + rl
+        rt = fr + rr
+        ltb = (lt - rt) / (4.0 * WHEEL_TORQUE_LIMIT)
+        lfb = np.where(np.abs(lt) > 1e-6, (fl - rl) / lt, 0.0)
+        rfb = np.where(np.abs(rt) > 1e-6, (fr - rr) / rt, 0.0)
+        act = np.clip(np.column_stack([ltb, lfb, rfb]), -1.0, 1.0).astype(np.float32)
+
+        # ── reward ───────────────────────────────────────────────────────────
+        wt   = np.column_stack([fl, fr, rl, rr])
+        yden = np.maximum(np.maximum(np.abs(yaw_rate), np.abs(ref_yr)), YAW_RATE_NORM_EPS)
+        yaw_pen    = YAW_RATE_WEIGHT    * ((yaw_rate - ref_yr) / yden) ** 2
+        effort_pen = ACTION_EFFORT_WEIGHT * np.sum((wt / WHEEL_TORQUE_LIMIT) ** 2, axis=1)
+        energy_pen = ENERGY_LOSS_WEIGHT   * df["batt_net_power_w"].values
+        rew = -(yaw_pen + effort_pen + energy_pen).astype(np.float32)
+
+        # ── t → t+1 페어링 ──────────────────────────────────────────────────
+        n = len(obs) - 1
+        done = np.zeros(n, dtype=np.float32)
+        done[-1] = 1.0  # 에피소드 끝
+
+        all_obs.append(obs[:-1])
+        all_nxt.append(obs[1:])
+        all_act.append(act[:-1])
+        all_rew.append(rew[:-1])
+        all_don.append(done)
+
+    if not all_obs:
+        print("[SEED] 유효한 파일 없음")
+        return 0
+
+    obs_a = np.concatenate(all_obs)
+    nxt_a = np.concatenate(all_nxt)
+    act_a = np.concatenate(all_act)
+    rew_a = np.concatenate(all_rew)
+    don_a = np.concatenate(all_don)
+
+    total   = len(obs_a)
+    buf     = model.replay_buffer
+    buf_cap = buf.buffer_size
+
+    if total > buf_cap:
+        idx   = np.random.choice(total, buf_cap, replace=False)
+        idx.sort()
+        obs_a, nxt_a = obs_a[idx], nxt_a[idx]
+        act_a, rew_a = act_a[idx], rew_a[idx]
+        don_a = don_a[idx]
+        total = buf_cap
+        print(f"[SEED] 서브샘플 → {total:,}")
+
+    # 버퍼 배열에 직접 쓰기 (n_envs=1 가정)
+    buf.observations[:total, 0, :]      = obs_a
+    buf.next_observations[:total, 0, :] = nxt_a
+    buf.actions[:total, 0, :]           = act_a
+    buf.rewards[:total, 0]              = rew_a
+    buf.dones[:total, 0]                = don_a
+    buf.pos  = total % buf_cap
+    buf.full = total >= buf_cap
+
+    print(f"[SEED] {total:,}개 transition 주입 완료 ({len(files)}개 파일)")
+    return total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 학습 루프
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_learning(env):
-    env  = Monitor(env, info_keywords=("yaw_penalty", "effort_penalty", "saturation_penalty"))
+    env  = Monitor(env, info_keywords=("yaw_penalty", "effort_penalty", "saturation_penalty", "energy_penalty"))
     algo = os.getenv("ALGO", "ppo").strip().lower()
     if algo not in {"ppo", "sac", "td3"}:
         raise ValueError(f"ALGO는 'ppo', 'sac', 'td3' 이어야 합니다. 받은 값: {algo}")
@@ -660,6 +788,11 @@ def run_learning(env):
         model.policy_delay        = algo_kwargs["policy_delay"]
         model.target_policy_noise = algo_kwargs["target_policy_noise"]
         model.target_noise_clip   = algo_kwargs["target_noise_clip"]
+
+    # 리플레이 버퍼 시딩 (SAC/TD3 전용, RB_SEED_DIR 설정 시)
+    rb_seed_dir = os.getenv("RB_SEED_DIR", "").strip()
+    if rb_seed_dir and algo in {"sac", "td3"}:
+        seed_replay_buffer_from_csv(model, rb_seed_dir)
 
     total_timesteps = int(os.getenv("TOTAL_TIMESTEPS", "1000000"))
     try:

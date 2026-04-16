@@ -17,12 +17,6 @@ import cvxpy as cp
 
 from torque_algorithms import TorqueDistributionAlgorithms
 
-try:
-    from stable_baselines3 import PPO, SAC, TD3
-    _SB3_AVAILABLE = True
-except ImportError:
-    _SB3_AVAILABLE = False
-
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -157,7 +151,10 @@ class RequiredYawMomentController:
     """EKF lateral-force observer + sliding-mode yaw-moment controller."""
 
     def __init__(self):
-        self.smc_k = env_float("YAWM_SMC_K", 200.0)
+        # WLTP
+        # self.smc_k = env_float("YAWM_SMC_K", 3.0)
+        #HWFET
+        self.smc_k = env_float("YAWM_SMC_K", 3.7)
         self.smc_eps = env_float("YAWM_SMC_EPS", 0.2)
         self.yaw_moment_limit = env_float("YAWM_LIMIT_NM", 10000.0)
 
@@ -204,10 +201,8 @@ class RequiredYawMomentController:
         self.mass_kg = env_float("YREF_MASS_KG", 2065.03)
         self.a_m = env_float("YREF_A_M", 1.169)
         self.b_m = env_float("YREF_B_M", 1.801)
-        # self.cf = env_float("YREF_CF", 180000.0)*2
-        # self.cr = env_float("YREF_CR", 120000.0)*2
-        self.cf = env_float("YREF_CF", 143000.0)
-        self.cr = env_float("YREF_CR", 143000.0)
+        self.cf = env_float("YREF_CF", 180000.0)*2
+        self.cr = env_float("YREF_CR", 120000.0)*2
         self.mu = env_float("YREF_MU", 0.95)
         self.g = env_float("YREF_G", 9.81)
         self.min_turn_radius_m = env_float("YREF_MIN_TURN_RADIUS_M", 10.0)
@@ -1016,7 +1011,6 @@ class TelemetryLogger:
                 "torque_fr",
                 "torque_rl",
                 "torque_rr",
-                "steering_cmd",
             ]
         )
 
@@ -1058,34 +1052,6 @@ def unpack_observation(raw: bytes, obs_dim: int):
     return veh_x, veh_y, veh_yaw, veh_v, veh_ax, veh_ay, rotv, long_slip, lat_slip, aero_drag, roll_resist
 
 
-def load_rl_model(model_path: str):
-    """SB3 모델 자동 로드 (파일명에서 algo 추론, 실패 시 순서대로 시도)."""
-    if not _SB3_AVAILABLE:
-        raise ImportError("stable_baselines3가 설치되어 있지 않습니다.")
-    path = Path(model_path)
-    if not path.exists():
-        path_zip = path.with_suffix(".zip")
-        if not path_zip.exists():
-            raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
-        model_path = str(path_zip)
-    name = Path(model_path).stem.lower()
-    if "sac" in name:
-        order = [SAC, TD3, PPO]
-    elif "td3" in name:
-        order = [TD3, SAC, PPO]
-    else:
-        order = [PPO, SAC, TD3]
-    for cls in order:
-        try:
-            m = cls.load(model_path, device="cpu")
-            print(f"[RL] {cls.__name__} 모델 로드: {model_path}  "
-                  f"action_dim={m.action_space.shape[0]}")
-            return m
-        except Exception:
-            continue
-    raise RuntimeError(f"모델 로드 실패: {model_path}")
-
-
 async def run_one_episode(
     loop: asyncio.AbstractEventLoop,
     simcontrol,
@@ -1101,7 +1067,6 @@ async def run_one_episode(
     realtime_factor: float,
     log_every: int,
     scenario_name: str = "",
-    model=None,
 ) -> None:
     client_sock = None
     stanley_controller = StanleySteeringController()
@@ -1176,7 +1141,6 @@ async def run_one_episode(
         torque_lpf_alpha = float(env_float("TORQUE_LPF_ALPHA", 0.2))
         torque_lpf_alpha = float(np.clip(torque_lpf_alpha, 0.0, 1.0))
         filt_wheel_torques = np.zeros(4, dtype=np.float64)
-        last_yaw_rate_sq_error = 0.0   # RL obs용: 이전 스텝의 (yaw_rate - ref)^2
 
         while True:
             step += 1
@@ -1263,53 +1227,22 @@ async def run_one_episode(
             fy_front = float(yaw_moment_controller.state.x_hat[1])
             fy_rear = float(yaw_moment_controller.state.x_hat[2])
 
-            # ── RL 인퍼런스 (TORQUE_DISTRIBUTION_MODE=rl) ─────────────────────────
-            if controller.distribution_mode == "rl" and model is not None:
-                obs = np.array([
-                    veh_v * 3.6,              # speed_kph
-                    yaw_rate_est,             # yaw_rate
-                    veh_ax,                   # ax
-                    veh_ay,                   # ay
-                    total_torque,             # total_torque (PID 출력)
-                    steering_cmd,             # steering_cmd (open-loop 사인파)
-                    last_yaw_rate_sq_error,   # yaw_rate_sq_error (이전 스텝)
-                ], dtype=np.float32)
-                action, _ = model.predict(obs, deterministic=True)
-                action = np.asarray(action, dtype=np.float32)
-
-                wlim = controller.wheel_torque_limit
-                ltb = float(np.clip(action[0], -1.0, 1.0))
-                lfb = float(np.clip(action[1], -1.0, 1.0)) if len(action) >= 3 else 0.0
-                rfb = float(np.clip(action[2], -1.0, 1.0)) if len(action) >= 3 else 0.0
-
-                half   = 0.5 * total_torque
-                lr_off = ltb * wlim * 2.0
-                lh = 0.5 * (half + lr_off)
-                rh = 0.5 * (half - lr_off)
-                fl = lh + lfb * lh;  rl_ = lh - lfb * lh
-                fr = rh + rfb * rh;  rr  = rh - rfb * rh
-                wheel_torques = np.clip([fl, fr, rl_, rr], -wlim, wlim).astype(np.float64)
-
-                last_yaw_rate_sq_error = float((yaw_rate_est - ref_yaw_rate) ** 2)
-
-            # ── 기존 알고 (algo0~algo4) ────────────────────────────────────────
-            else:
-                wheel_torques = controller.distribute_torque(
-                    total_torque=total_torque,
-                    req_yaw_moment=req_yaw_moment_nm,
-                    veh_speed=veh_v,
-                    veh_ax=veh_ax,
-                    veh_ay=veh_ay,
-                    yaw_rate=yaw_rate_est,
-                    ref_yaw_rate=ref_yaw_rate,
-                    steering_cmd=steering_cmd,
-                    dt=control_dt,
-                    rotv=rotv,
-                    motor_map=motor_map,
-                    fy_front=fy_front,
-                    fy_rear=fy_rear,
-                )
-
+            # Distribute total torque to 4 wheels using selected yaw-moment-aware algorithm.
+            wheel_torques = controller.distribute_torque(
+                total_torque=total_torque,
+                req_yaw_moment=req_yaw_moment_nm,
+                veh_speed=veh_v,
+                veh_ax=veh_ax,
+                veh_ay=veh_ay,
+                yaw_rate=yaw_rate_est,
+                ref_yaw_rate=ref_yaw_rate,
+                steering_cmd=steering_cmd,
+                dt=control_dt,
+                rotv=rotv,
+                motor_map=motor_map,
+                fy_front=fy_front,
+                fy_rear=fy_rear,
+            )
             algo2_lpf_enable = env_bool("ALGO2_LPF_ENABLE", True)
             algo3_lpf_enable = env_bool("ALGO3_LPF_ENABLE", True)
             if (controller.distribution_mode == "algo2" and algo2_lpf_enable) or (
@@ -1438,7 +1371,6 @@ async def run_one_episode(
                     float(wheel_torques[1]),
                     float(wheel_torques[2]),
                     float(wheel_torques[3]),
-                    float(steering_cmd),
                 ]
             )
 
@@ -1516,15 +1448,6 @@ async def main() -> None:
     motor_map = MotorMap(Path(DEFAULT_MG_MAP_PATH))
     if not motor_map.load():
         raise RuntimeError("Motor map load failed; cannot run without it.")
-
-    # RL 모델 로드 (TORQUE_DISTRIBUTION_MODE=rl 일 때만)
-    rl_model = None
-    if controller.distribution_mode == "rl":
-        rl_model_path = os.getenv("RL_MODEL_PATH", "")
-        if not rl_model_path:
-            raise ValueError("TORQUE_DISTRIBUTION_MODE=rl 이지만 RL_MODEL_PATH가 설정되지 않았습니다.")
-        rl_model = load_rl_model(rl_model_path)
-        print(f"[RL] 인퍼런스 모드 활성화: {rl_model_path}")
     
     # Extract scenario name from path (e.g., "simulation_results_HWFET_ay9p0.csv" -> "HWFET_ay9p0")
     scenario_name = ""
@@ -1555,7 +1478,6 @@ async def main() -> None:
                 realtime_factor=realtime_factor,
                 log_every=log_every,
                 scenario_name=scenario_name,
-                model=rl_model,
             )
     finally:
         server_sock.close()

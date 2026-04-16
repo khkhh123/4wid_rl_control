@@ -363,3 +363,90 @@ async def carmaker_orchestrator(env, simcontrol, variation, server_sock):
             env.client_sock = None
         print("[Orchestrator] Episode Finished & Cleaned up.")
         await simcontrol.disconnect()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 모터 효율맵
+# ──────────────────────────────────────────────────────────────────────────────
+
+class MotorMap:
+    """모터 토크 한계 및 효율 맵 로더. batt_net_power 계산에 필요한 메서드만 포함."""
+
+    def __init__(self, map_path: Path):
+        self.map_path  = map_path
+        self.loaded    = False
+        self.spd_rpm   = None
+        self.trq_max_nm = None
+        self.eff_spd_rpm = None
+        self.eff_trq_nm  = None
+        self.eff_map_pct = None
+
+    def load(self) -> bool:
+        if not self.map_path.exists():
+            print(f"[WARN] Motor map not found: {self.map_path}")
+            return False
+        try:
+            import scipy.io as sio
+            m = sio.loadmat(self.map_path)
+        except Exception as e:
+            print(f"[WARN] Failed to load motor map: {e}")
+            return False
+        try:
+            self.spd_rpm     = np.asarray(m["spd_rpm"],    dtype=np.float64).reshape(-1)
+            self.trq_max_nm  = np.asarray(m["trq_max_Nm"], dtype=np.float64).reshape(-1)
+            self.eff_spd_rpm = np.asarray(m["eff_spd_rpm"], dtype=np.float64).reshape(-1)
+            self.eff_trq_nm  = np.asarray(m["trq_Nm"],      dtype=np.float64).reshape(-1)
+            eff_raw = np.asarray(m.get("calc_eff", m.get("original_eff")), dtype=np.float64)
+            if eff_raw.ndim != 2:
+                raise ValueError("Efficiency map must be 2D")
+            self.eff_map_pct = eff_raw
+            self.loaded = True
+            print(f"[INFO] Motor map loaded: {self.map_path}")
+            return True
+        except Exception as e:
+            print(f"[WARN] Invalid motor map contents: {e}")
+            return False
+
+    def max_torque_nm(self, rpm: float) -> float:
+        if not self.loaded:
+            return float("inf")
+        r = abs(float(rpm))
+        return float(np.interp(r, self.spd_rpm, self.trq_max_nm,
+                               left=self.trq_max_nm[0], right=self.trq_max_nm[-1]))
+
+    def efficiency_pct(self, rpm: float, torque_nm: float) -> float:
+        if not self.loaded:
+            return 100.0
+        t = abs(float(torque_nm))
+        if t <= 1e-9:
+            return 100.0
+        r = abs(float(rpm))
+        t_clip = float(np.clip(t, self.eff_trq_nm[0], self.eff_trq_nm[-1]))
+        r_clip = float(np.clip(r, self.eff_spd_rpm[0], self.eff_spd_rpm[-1]))
+        col_vals = np.array(
+            [np.interp(t_clip, self.eff_trq_nm, self.eff_map_pct[:, j])
+             for j in range(self.eff_spd_rpm.size)],
+            dtype=np.float64,
+        )
+        eff = float(np.interp(r_clip, self.eff_spd_rpm, col_vals))
+        return float(np.clip(eff, 1.0, 100.0))
+
+
+def compute_batt_net_power(wheel_torques: np.ndarray, rotv: np.ndarray, motor_map: "MotorMap") -> float:
+    """wheel_torques(Nm) × rotv(rad/s) + 모터 효율맵 → 배터리 순 소비 전력(W)."""
+    batt_drive = 0.0
+    batt_regen = 0.0
+    for w in range(4):
+        omega     = abs(float(rotv[w]))
+        rpm       = omega * 60.0 / (2.0 * np.pi)
+        tq        = float(wheel_torques[w])
+        tq_max    = motor_map.max_torque_nm(rpm)
+        sat_drive = min(max(tq, 0.0), tq_max)
+        sat_regen = min(max(-tq, 0.0), tq_max)
+        if sat_drive > 1e-9:
+            eff = max(motor_map.efficiency_pct(rpm, sat_drive) / 100.0, 1e-3)
+            batt_drive += (sat_drive * omega) / eff
+        if sat_regen > 1e-9:
+            eff = max(motor_map.efficiency_pct(rpm, sat_regen) / 100.0, 1e-3)
+            batt_regen += (sat_regen * omega) * eff
+    return batt_drive - batt_regen

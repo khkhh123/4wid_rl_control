@@ -101,7 +101,7 @@ SAC_PRESETS = {
     },
     "C": {
         "learning_rate": 3e-4, "batch_size": 512,  "gamma": 0.995,  "ent_coef": "auto",
-        "tau": 0.01,  "buffer_size": 1000000, "learning_starts": 5000,
+        "tau": 0.01,  "buffer_size": 1500000, "learning_starts": 5000,
         "train_freq": (1, "step"), "gradient_steps": 4, "policy_kwargs": {"net_arch": [256, 256, 256]},
     },
 }
