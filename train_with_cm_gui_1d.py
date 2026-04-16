@@ -1,8 +1,11 @@
 """
-CarMaker GUI + PPO/SAC/TD3 학습 스크립트 (단일 환경).
+CarMaker GUI + PPO/SAC/TD3 학습 스크립트 (단일 환경, 1D 액션).
+
+액션을 left_total_bias 하나만 사용합니다.
+left_fr_bias / right_fr_bias 는 0.0 고정 (전/후 50:50).
 
 사용법:
-    python3 train_with_cm_gui.py [A|B|C]   # 알고리즘 프리셋 선택
+    python3 train_with_cm_gui_1d.py [A|B|C]   # 알고리즘 프리셋 선택
 
 주요 환경변수:
     ALGO                : ppo | sac | td3  (기본: ppo)
@@ -63,9 +66,9 @@ SCENARIO_CSV_PATH = os.getenv("SCENARIO_CSV_PATH", "").strip()
 OPEN_LOOP_STEER             = os.getenv("OPEN_LOOP_STEER", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
 OPEN_LOOP_STEER_AMP_DEG     = float(os.getenv("OPEN_LOOP_STEER_AMP_DEG",   "60.0"))
 OPEN_LOOP_STEER_PERIOD_S    = float(os.getenv("OPEN_LOOP_STEER_PERIOD_S",  "4.0"))
-OPEN_LOOP_STEER_START_S     = float(os.getenv("OPEN_LOOP_STEER_START_S",   "0.0"))
+OPEN_LOOP_STEER_START_S     = float(os.getenv("OPEN_LOOP_STEER_START_S",   "36.0"))
 OPEN_LOOP_STEER_CYCLES      = max(0, int(float(os.getenv("OPEN_LOOP_STEER_CYCLES", "700.0"))))
-OPEN_LOOP_SPEED_KPH         = float(os.getenv("OPEN_LOOP_SPEED_KPH",       "80.0"))
+OPEN_LOOP_SPEED_KPH         = float(os.getenv("OPEN_LOOP_SPEED_KPH",       "60.0"))
 OPEN_LOOP_SPEED_MODE        = os.getenv("OPEN_LOOP_SPEED_MODE", "mixed").strip().lower()  # constant | mixed
 OPEN_LOOP_SPEED_MIN_KPH     = float(os.getenv("OPEN_LOOP_SPEED_MIN_KPH",   "0.0"))
 OPEN_LOOP_SPEED_MAX_KPH     = float(os.getenv("OPEN_LOOP_SPEED_MAX_KPH",   "60.0"))
@@ -77,8 +80,7 @@ OPEN_LOOP_CRUISE_LOW_DURATION_S  = float(os.getenv("OPEN_LOOP_CRUISE_LOW_DURATIO
 # ─────────────────────────────────────────────────────────────────────────────
 # [3] 알고리즘 프리셋  ◀  자주 수정
 # ─────────────────────────────────────────────────────────────────────────────
-# MODEL_BASENAME = os.getenv("MODEL_BASENAME", "carmaker_ppo_4wid_dyc").strip()
-MODEL_BASENAME = os.getenv("MODEL_BASENAME", "carmaker_sac_4wid_dyc_C").strip()
+MODEL_BASENAME = os.getenv("MODEL_BASENAME", "carmaker_sac_4wid_dyc_1d_C").strip()
 
 PPO_PRESETS = {
     "A": {"learning_rate": 1e-4,  "batch_size": 256, "gamma": 0.99,  "n_steps": 1024, "ent_coef": 0.1},
@@ -156,16 +158,16 @@ def find_scenario_csv_files(base_dir: Path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CarMaker 4WID 환경
+# CarMaker 4WID 환경 (1D 액션)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CarMaker4WIDEnv(gym.Env):
     """
-    4WID DYC (Direct Yaw-rate Control) RL 환경.
+    4WID DYC (Direct Yaw-rate Control) RL 환경 — 1D 액션 버전.
 
-    액션: [left_total_bias, left_fr_bias, right_fr_bias]  각 [-1, 1]
+    액션: [left_total_bias]  [-1, 1]
       - left_total_bias  : 좌/우 총토크 편차 바이어스
-      - left/right_fr_bias: 전/후축 토크 배분 바이어스 (-1=후100%, +1=전100%)
+      - left_fr_bias / right_fr_bias 는 0.0 고정 (전/후 50:50)
 
     관측: [speed_kph, yaw_rate, ax, ay, total_torque, steering_cmd, yaw_rate_sq_error]
     """
@@ -189,7 +191,7 @@ class CarMaker4WIDEnv(gym.Env):
 
         # 에피소드 설정
         self.max_steps        = int(os.getenv("EPISODE_MAX_STEPS", "15300"))   # HWFET: 765s / 0.05s
-        self.early_done_penalty = float(os.getenv("EARLY_DONE_PENALTY", "-200000.0"))
+        self.early_done_penalty = float(os.getenv("EARLY_DONE_PENALTY", "-0.0"))
         self.control_dt       = max(CONTROL_DT, 1e-3)
 
         # 내부 상태
@@ -231,14 +233,12 @@ class CarMaker4WIDEnv(gym.Env):
         self.reset_req   = asyncio.Event()
         self.ready_evt   = asyncio.Event()
         self.stop_req    = asyncio.Event()
-        # truncation 후 "Simulation still running" tail 구간 표시:
-        # True이면 연결 끊김을 조기 중단이 아닌 자연 종료로 처리.
         self._in_sim_tail = False
 
-        # 액션·관측 공간
+        # 액션·관측 공간 — 1D 액션
         self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
-            high=np.array([1.0,  1.0,  1.0],  dtype=np.float32),
+            low=np.array([-1.0], dtype=np.float32),
+            high=np.array([1.0],  dtype=np.float32),
             dtype=np.float32,
         )
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
@@ -260,9 +260,6 @@ class CarMaker4WIDEnv(gym.Env):
         ════════════════════════════════════════════════
         반환: (reward, yaw_penalty, effort_penalty, saturation_penalty)
         """
-        # actual과 ref 중 큰 쪽으로 정규화:
-        #   직진(ref≈0, actual 작음) → actual이 분모 → 작은 모멘트도 엄격하게 패널티
-        #   코너링(ref 큼, actual 못 미침) → ref가 분모 → 물리적 한계에 관대하게
         yaw_den = max(abs(actual_yaw_rate), abs(ref_yaw_rate), YAW_RATE_NORM_EPS)
         yaw_penalty        = YAW_RATE_WEIGHT * ((actual_yaw_rate - ref_yaw_rate) / yaw_den) ** 2
         effort_penalty     = ACTION_EFFORT_WEIGHT * float(np.sum((wheel_torques / WHEEL_TORQUE_LIMIT) ** 2))
@@ -374,10 +371,10 @@ class CarMaker4WIDEnv(gym.Env):
         return state, obs
 
     def _build_assessment_action(self, action):
-        action         = np.asarray(action, dtype=np.float32)
+        action          = np.asarray(action, dtype=np.float32)
         left_total_bias = float(np.clip(action[0], -1.0, 1.0))
-        left_fr_bias    = float(np.clip(action[1], -1.0, 1.0))
-        right_fr_bias   = float(np.clip(action[2], -1.0, 1.0))
+        left_fr_bias    = 0.0   # 전/후 50:50 고정
+        right_fr_bias   = 0.0   # 전/후 50:50 고정
 
         sim_time  = float(self.scenario_global_step) * self.control_dt
         ref_state = None
@@ -405,10 +402,10 @@ class CarMaker4WIDEnv(gym.Env):
         lr_off  = left_total_bias * WHEEL_TORQUE_LIMIT * 2.0
         lh      = 0.5 * (half + lr_off)
         rh      = 0.5 * (half - lr_off)
-        fl      = lh + left_fr_bias   * lh
-        rl      = lh - left_fr_bias   * lh
-        fr      = rh + right_fr_bias  * rh
-        rr      = rh - right_fr_bias  * rh
+        fl      = lh + left_fr_bias  * lh
+        rl      = lh - left_fr_bias  * lh
+        fr      = rh + right_fr_bias * rh
+        rr      = rh - right_fr_bias * rh
 
         wheel_torques     = np.array([fl, fr, rl, rr], dtype=np.float32)
         wheel_torques_sat = np.clip(wheel_torques, -WHEEL_TORQUE_LIMIT, WHEEL_TORQUE_LIMIT)
@@ -466,7 +463,6 @@ class CarMaker4WIDEnv(gym.Env):
         self.speed_controller.reset()
 
         if self.client_sock is None:
-            # 활성 연결 없음 → 오케스트레이터에 새 시뮬레이션 요청
             self._in_sim_tail = False
             print("[ENV] No active connection. Requesting new simulation...")
             self._advance_scenario()
@@ -474,8 +470,6 @@ class CarMaker4WIDEnv(gym.Env):
             await self.ready_evt.wait()
             self.ready_evt.clear()
         else:
-            # 시뮬레이션 계속 실행 중 → 내부 상태만 리셋
-            # (이전 에피소드 max_steps truncation 후 CM이 아직 돌고 있는 tail 구간)
             self._in_sim_tail = True
             print("[ENV] Simulation still running (tail). Resetting internal state only.")
 
@@ -498,7 +492,6 @@ class CarMaker4WIDEnv(gym.Env):
             )
 
             if not raw_data or len(raw_data) < self.state_recv_bytes:
-                # 소켓 종료 → 조기 중단 vs 자연 종료 판정
                 self.client_sock = None
                 if self.step_count >= self.max_steps or self._in_sim_tail:
                     was_tail = self._in_sim_tail
@@ -527,7 +520,7 @@ class CarMaker4WIDEnv(gym.Env):
                 actual_yaw_rate, ref_yaw_rate, wheel_torques, wheel_saturation_penalty
             )
 
-            terminated = False  # 시뮬 상태는 소켓 끊김으로만 감지
+            terminated = False
             truncated  = self.step_count >= self.max_steps
             done       = terminated or truncated
 
@@ -544,14 +537,12 @@ class CarMaker4WIDEnv(gym.Env):
             self.client_sock = None
 
             if self.step_count >= self.max_steps or self._in_sim_tail:
-                # 정상 truncation 또는 tail 구간 자연 종료
                 was_tail = self._in_sim_tail
                 self._in_sim_tail = False
                 reward = 0.0
                 terminated, truncated = False, True
                 print(f"[STEP] 자연 종료 (exception, tail={was_tail}). Normal truncation.")
             elif self.last_obs is not None and self.last_action_info:
-                # 조기 중단: 마지막 관측 기반 보상 + 조기 중단 패널티
                 actual_yaw_rate = float(self.last_obs[1])
                 ref_yaw_rate_ex = float(self.last_action_info.get("ref_yaw_rate", 0.0))
                 torques_ex = np.array([

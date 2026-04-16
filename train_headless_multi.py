@@ -44,6 +44,7 @@ class SaveBestEpisodeRewardVecCallback(BaseCallback):
         self.current_effort_penalties = np.zeros(n_envs, dtype=np.float64)
         self.current_saturation_penalties = np.zeros(n_envs, dtype=np.float64)
         self.episode_count = 0
+        self._log_interval = int(os.getenv("LOG_INTERVAL_STEPS", "500"))
         if os.path.exists(self.best_reward_path):
             try:
                 with open(self.best_reward_path, "r") as f:
@@ -69,6 +70,12 @@ class SaveBestEpisodeRewardVecCallback(BaseCallback):
         rewards = np.asarray(rewards, dtype=np.float64)
         dones = np.asarray(dones, dtype=bool)
         self.current_episode_rewards += rewards
+
+        # 중간 단계 로깅 (에피소드 완료를 기다리지 않고 주기적으로 기록)
+        if self._log_interval > 0 and self.num_timesteps % self._log_interval == 0:
+            self.logger.record("train/mean_step_reward", float(np.mean(rewards)))
+            self.logger.record("train/mean_ep_reward_so_far", float(np.mean(self.current_episode_rewards)))
+            self.logger.dump(self.num_timesteps)
 
         done_indices = np.where(dones)[0]
         for idx in done_indices:
@@ -448,7 +455,7 @@ def build_worker_env(worker_id: int):
     # Default: isolate each worker's model/log files to avoid write races.
     model_mode = env.setdefault("MULTI_MODEL_MODE", "per_worker").strip().lower()
     if model_mode == "per_worker":
-        base = os.getenv("MODEL_BASENAME", "carmaker_sac_4wid_dyc")
+        base = os.getenv("MODEL_BASENAME", "carmaker_sac_4wid_dyc_C")
         tb = os.getenv("TB_DIRNAME", "carmaker_sac_4wid_dyc_tensorboard")
         env.setdefault("MODEL_BASENAME", f"{base}_w{worker_id}")
         env.setdefault("TB_DIRNAME", f"{tb}_w{worker_id}")
@@ -527,15 +534,15 @@ def run_shared_training(num_workers: int, profile: str):
         load_path = os.getenv("LOAD_MODEL_PATH", "").strip()
         if load_path and os.path.exists(load_path):
             print(f"[SHARED] 체크포인트 로드: '{load_path}' -> 저장 경로: '{model_path}'")
-            model = model_class.load(load_path, env=vec_env, device="cpu", verbose=1, tensorboard_log=log_dir)
+            model = model_class.load(load_path, env=vec_env, device="cuda", verbose=1, tensorboard_log=log_dir)
         elif os.path.exists(model_path):
             print(f"[SHARED] Loading existing model: {model_path}")
-            model = model_class.load(model_path, env=vec_env, device="cpu", verbose=1, tensorboard_log=log_dir)
+            model = model_class.load(model_path, env=vec_env, device="cuda", verbose=1, tensorboard_log=log_dir)
         else:
             if load_path:
                 print(f"[WARN] LOAD_MODEL_PATH='{load_path}' 파일 없음. 새 모델로 시작합니다.")
             print(f"[SHARED] No model found. Creating a new {algo.upper()} model.")
-            model = model_class("MlpPolicy", vec_env, verbose=1, device="cpu", tensorboard_log=log_dir, **algo_kwargs)
+            model = model_class("MlpPolicy", vec_env, verbose=1, device="cuda", tensorboard_log=log_dir, **algo_kwargs)
 
         if algo == "ppo":
             model.n_steps = algo_kwargs["n_steps"]

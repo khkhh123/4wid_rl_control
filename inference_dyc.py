@@ -269,6 +269,7 @@ def run_inference(model: PPO, env: SyncBridge, env_async: CarMaker4WIDEnv,
                         action = UNIFORM_ACTION.copy()
                     else:
                         action, _ = model.predict(obs, deterministic=True)
+                        # print(obs)
 
                     obs, reward, terminated, truncated, info = env.step(action)
                     step += 1
