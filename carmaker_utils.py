@@ -290,9 +290,15 @@ class SaveBestEpisodeRewardCallback(BaseCallback):
                 self.logger.record("episode/yaw_penalty",        ep_info.get("yaw_penalty",        0.0))
                 self.logger.record("episode/effort_penalty",     ep_info.get("effort_penalty",     0.0))
                 self.logger.record("episode/saturation_penalty", ep_info.get("saturation_penalty", 0.0))
+                self.logger.record("episode/energy_penalty",     ep_info.get("energy_penalty",     0.0))
             self.logger.dump(self.num_timesteps)
             if self.verbose:
-                print(f"[EP {self.episode_count}] reward={self.current_episode_reward:.3f}")
+                yaw_pen = ep_info.get("yaw_penalty",    0.0) if ep_info else 0.0
+                eff_pen = ep_info.get("effort_penalty", 0.0) if ep_info else 0.0
+                sat_pen = ep_info.get("saturation_penalty", 0.0) if ep_info else 0.0
+                eng_pen = ep_info.get("energy_penalty", 0.0) if ep_info else 0.0
+                print(f"[EP {self.episode_count}] reward={self.current_episode_reward:.3f} "
+                      f"| yaw={yaw_pen:.3f} effort={eff_pen:.3f} sat={sat_pen:.3f} energy={eng_pen:.3f}")
             self.current_episode_reward = 0.0
         return True
 
@@ -348,11 +354,12 @@ async def carmaker_orchestrator(env, simcontrol, variation, server_sock):
         env.client_sock, _ = await loop.run_in_executor(None, server_sock.accept)
         raw_obs = await loop.run_in_executor(None, recv_exact, env.client_sock, env.state_recv_bytes)
 
+        from train_with_cm_gui import OBS_SCALE
         _, obs = env._parse_assessment_state(raw_obs)
         obs.append(env.last_total_torque)
         obs.append(env.last_steering_cmd)
         obs.append(env.last_yaw_rate_sq_error)
-        env.last_obs = obs
+        env.last_obs = (np.asarray(obs, dtype=np.float32) / OBS_SCALE).tolist()
         env.ready_evt.set()
 
         await simcontrol.create_simstate_condition(cmapi.ConditionSimState.idle).wait()
@@ -387,6 +394,7 @@ class MotorMap:
             return False
         try:
             import scipy.io as sio
+            from scipy.interpolate import RegularGridInterpolator
             m = sio.loadmat(self.map_path)
         except Exception as e:
             print(f"[WARN] Failed to load motor map: {e}")
@@ -399,7 +407,15 @@ class MotorMap:
             eff_raw = np.asarray(m.get("calc_eff", m.get("original_eff")), dtype=np.float64)
             if eff_raw.ndim != 2:
                 raise ValueError("Efficiency map must be 2D")
-            self.eff_map_pct = eff_raw
+            self.eff_map_pct = eff_raw  # shape: (n_trq, n_spd)
+            # 2D 보간기를 미리 빌드 → efficiency_pct 호출 시 단일 C 호출로 처리
+            self._eff_interp = RegularGridInterpolator(
+                (self.eff_trq_nm, self.eff_spd_rpm),
+                self.eff_map_pct,
+                method="linear",
+                bounds_error=False,
+                fill_value=None,  # 범위 밖은 경계값으로 클램프
+            )
             self.loaded = True
             print(f"[INFO] Motor map loaded: {self.map_path}")
             return True
@@ -420,15 +436,9 @@ class MotorMap:
         t = abs(float(torque_nm))
         if t <= 1e-9:
             return 100.0
-        r = abs(float(rpm))
-        t_clip = float(np.clip(t, self.eff_trq_nm[0], self.eff_trq_nm[-1]))
-        r_clip = float(np.clip(r, self.eff_spd_rpm[0], self.eff_spd_rpm[-1]))
-        col_vals = np.array(
-            [np.interp(t_clip, self.eff_trq_nm, self.eff_map_pct[:, j])
-             for j in range(self.eff_spd_rpm.size)],
-            dtype=np.float64,
-        )
-        eff = float(np.interp(r_clip, self.eff_spd_rpm, col_vals))
+        t_clip = float(np.clip(t, self.eff_trq_nm[0],  self.eff_trq_nm[-1]))
+        r_clip = float(np.clip(abs(float(rpm)), self.eff_spd_rpm[0], self.eff_spd_rpm[-1]))
+        eff = float(self._eff_interp([[t_clip, r_clip]])[0])
         return float(np.clip(eff, 1.0, 100.0))
 
 
@@ -450,3 +460,50 @@ def compute_batt_net_power(wheel_torques: np.ndarray, rotv: np.ndarray, motor_ma
             eff = max(motor_map.efficiency_pct(rpm, sat_regen) / 100.0, 1e-3)
             batt_regen += (sat_regen * omega) * eff
     return batt_drive - batt_regen
+
+
+def compute_batt_net_power_batch(
+    tq_matrix: np.ndarray,   # (N, 4) wheel torques
+    omega_vec: np.ndarray,   # (N,)   wheel angular velocity (rad/s, same for all 4)
+    motor_map: "MotorMap",
+) -> np.ndarray:
+    """
+    벡터화된 배터리 순 소비 전력 계산. (N,) → batt_net[i] = batt_drive[i] - batt_regen[i]
+    motor_map 미로드 시 효율 100% 가정 (scalar compute와 동일 fallback).
+    """
+    N = len(omega_vec)
+    omega_abs = np.abs(omega_vec)
+    rpm_vec   = omega_abs * (60.0 / (2.0 * np.pi))
+    batt      = np.zeros(N, dtype=np.float64)
+
+    if motor_map.loaded:
+        tq_max_vec = np.interp(rpm_vec, motor_map.spd_rpm, motor_map.trq_max_nm)
+        r_clip = np.clip(rpm_vec, motor_map.eff_spd_rpm[0], motor_map.eff_spd_rpm[-1])
+    else:
+        tq_max_vec = np.full(N, np.inf)
+        r_clip     = None
+
+    for w in range(4):
+        tq    = tq_matrix[:, w].astype(np.float64)
+        drive = np.clip(tq,  0.0, tq_max_vec)
+        regen = np.clip(-tq, 0.0, tq_max_vec)
+
+        d_mask = drive > 1e-9
+        r_mask = regen > 1e-9
+
+        if motor_map.loaded:
+            if d_mask.any():
+                t_d = np.clip(drive[d_mask], motor_map.eff_trq_nm[0], motor_map.eff_trq_nm[-1])
+                eff = np.clip(motor_map._eff_interp(
+                    np.column_stack([t_d, r_clip[d_mask]])) / 100.0, 1e-3, 1.0)
+                batt[d_mask] += (drive[d_mask] * omega_abs[d_mask]) / eff
+            if r_mask.any():
+                t_r = np.clip(regen[r_mask], motor_map.eff_trq_nm[0], motor_map.eff_trq_nm[-1])
+                eff = np.clip(motor_map._eff_interp(
+                    np.column_stack([t_r, r_clip[r_mask]])) / 100.0, 1e-3, 1.0)
+                batt[r_mask] -= (regen[r_mask] * omega_abs[r_mask]) * eff
+        else:
+            batt[d_mask] += drive[d_mask] * omega_abs[d_mask]
+            batt[r_mask] -= regen[r_mask] * omega_abs[r_mask]
+
+    return batt

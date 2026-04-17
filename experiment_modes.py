@@ -37,9 +37,10 @@ def resolve_reward_mode(action_mode: str) -> str:
 
 
 def default_model_basename(action_mode: str) -> str:
+    algo = os.getenv("ALGO", "sac").strip().lower()
     if action_mode == ACTION_MODE_ACTION4:
-        return "carmaker_ppo_4wid_action4_dyc"
-    return "carmaker_ppo_4wid_dyc"
+        return f"carmaker_{algo}_4wid_action4_dyc"
+    return f"carmaker_{algo}_4wid_dyc"
 
 
 def resolve_model_basename(action_mode: str) -> str:
@@ -47,9 +48,10 @@ def resolve_model_basename(action_mode: str) -> str:
 
 
 def default_tensorboard_dir(action_mode: str) -> str:
+    algo = os.getenv("ALGO", "sac").strip().lower()
     if action_mode == ACTION_MODE_ACTION4:
-        return "ppo_carmaker_action4_tensorboard"
-    return "ppo_carmaker_lefttorque_ratio3_tensorboard"
+        return f"{algo}_carmaker_action4_tensorboard"
+    return f"{algo}_carmaker_lefttorque_ratio3_tensorboard"
 
 
 def resolve_tensorboard_dir(action_mode: str) -> str:

@@ -44,16 +44,16 @@ from carmaker_utils import (  # noqa: E402
     carmaker_orchestrator,
     MotorMap,
     compute_batt_net_power,
+    compute_batt_net_power_batch,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [1] 보상 함수 파라미터  ◀  자주 수정
 # ─────────────────────────────────────────────────────────────────────────────
-YAW_RATE_WEIGHT          = float(os.getenv("YAW_RATE_WEIGHT",          "1e+2"))
-ACTION_EFFORT_WEIGHT     = float(os.getenv("ACTION_EFFORT_WEIGHT",     "1e-0"))
-SATURATION_PENALTY_WEIGHT = float(os.getenv("SATURATION_PENALTY_WEIGHT", "1e-2"))
-ENERGY_LOSS_WEIGHT       = float(os.getenv("ENERGY_LOSS_WEIGHT",       "1e-5"))
-YAW_RATE_NORM_EPS        = float(os.getenv("YAW_RATE_NORM_EPS",        "0.01"))
+YAW_RATE_WEIGHT           = float(os.getenv("YAW_RATE_WEIGHT",          "10"))
+ACTION_EFFORT_WEIGHT      = float(os.getenv("ACTION_EFFORT_WEIGHT",     "0"))
+SATURATION_PENALTY_WEIGHT = float(os.getenv("SATURATION_PENALTY_WEIGHT", "0"))
+YAW_RATE_NORM_EPS         = float(os.getenv("YAW_RATE_NORM_EPS",        "0.01"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [2] 시나리오 / 에피소드 설정  ◀  자주 수정
@@ -80,8 +80,30 @@ OPEN_LOOP_CRUISE_LOW_DURATION_S  = float(os.getenv("OPEN_LOOP_CRUISE_LOW_DURATIO
 # ─────────────────────────────────────────────────────────────────────────────
 # [3] 알고리즘 프리셋  ◀  자주 수정
 # ─────────────────────────────────────────────────────────────────────────────
+# 스크립트 위치 기준 절대 경로로 고정 (CarMaker가 cwd를 바꿔도 올바른 위치에 저장됨)
+_SCRIPT_DIR = Path(__file__).resolve().parent
 # MODEL_BASENAME = os.getenv("MODEL_BASENAME", "carmaker_ppo_4wid_dyc").strip()
-MODEL_BASENAME = os.getenv("MODEL_BASENAME", "carmaker_sac_4wid_dyc_C").strip()
+_MODEL_BASENAME = os.getenv("MODEL_BASENAME", "carmaker_sac_4wid_dyc_C_cl").strip()
+
+# ── 커리큘럼 학습 단계 (Reward Curriculum 방식) ────────────────────────────
+# CURRICULUM_STAGE=0 : 커리큘럼 없음 (ENERGY_LOSS_WEIGHT 기본 0.1)
+# CURRICULUM_STAGE=1 : Stage 1 – DYC 전용  (ENERGY_LOSS_WEIGHT 기본 0.03 → 직선 action=0 인센티브)
+# CURRICULUM_STAGE=2 : Stage 2 – 에너지 추가 (ENERGY_LOSS_WEIGHT 기본 2.0 → fr_bias 학습 유도)
+CURRICULUM_STAGE = int(os.getenv("CURRICULUM_STAGE", "0"))
+_MODEL_OUTPUT_DIR = os.getenv("MODEL_OUTPUT_DIR", "").strip()
+if _MODEL_OUTPUT_DIR:
+    _base = Path(_MODEL_OUTPUT_DIR)
+    if not _base.is_absolute():
+        _base = _SCRIPT_DIR / _base
+    _base.mkdir(parents=True, exist_ok=True)
+    MODEL_BASENAME = str(_base / _MODEL_BASENAME)
+else:
+    MODEL_BASENAME = str(_SCRIPT_DIR / _MODEL_BASENAME)
+
+# ENERGY_LOSS_WEIGHT: Stage 1=0.03 (직선 action=0 인센티브), Stage 2=2.0 (에너지 학습), 0=0.1 (기존)
+# 환경변수로 덮어쓰기 가능
+_ENERGY_DEFAULT = "0.03" if CURRICULUM_STAGE == 1 else ("2.0" if CURRICULUM_STAGE == 2 else "0.1")
+ENERGY_LOSS_WEIGHT = float(os.getenv("ENERGY_LOSS_WEIGHT", _ENERGY_DEFAULT))
 
 PPO_PRESETS = {
     "A": {"learning_rate": 1e-4,  "batch_size": 256, "gamma": 0.99,  "n_steps": 1024, "ent_coef": 0.1},
@@ -101,9 +123,9 @@ SAC_PRESETS = {
         "train_freq": (1, "step"), "gradient_steps": 1,
     },
     "C": {
-        "learning_rate": 3e-4, "batch_size": 512,  "gamma": 0.995,  "ent_coef": "auto",
-        "tau": 0.01,  "buffer_size": 1500000, "learning_starts": 5000,
-        "train_freq": (1, "step"), "gradient_steps": 4, "policy_kwargs": {"net_arch": [256, 256, 256]},
+        "learning_rate": 3e-4, "batch_size": 256,  "gamma": 0.99,   "ent_coef": "auto",
+        "tau": 0.005, "buffer_size": 1500000, "learning_starts": 5000,
+        "train_freq": (1, "step"), "gradient_steps": 1, "policy_kwargs": {"net_arch": [256, 256]},
     },
 }
 
@@ -138,6 +160,17 @@ CONTROL_DT         = float(os.getenv("CONTROL_DT",         "0.05"))
 # 속도 PI 제어기: CTRL_KP / CTRL_KI / CTRL_KD / INTEGRAL_LIMIT (env var, carmaker_utils에서 읽음)
 # Stanley 조향 제어기: STANLEY_G1 / G2 / K / SCALE (env var, carmaker_utils에서 읽음)
 # 차량 동역학: VEH_MASS_KG / VEH_A_M / VEH_B_M / VEH_CF / VEH_CR / VEH_STEER_RATIO / VEH_MU (env var)
+
+# observation 정규화 스케일 (각 obs를 이 값으로 나누면 대략 [-1, 1] 범위)
+OBS_SCALE = np.array([
+    float(os.getenv("OBS_SCALE_SPEED",      "100.0")),   # speed_kph         (0 ~ 200)
+    float(os.getenv("OBS_SCALE_YAW_RATE",     "0.4")),   # yaw_rate  rad/s   (-2 ~ 2)
+    float(os.getenv("OBS_SCALE_AX",          "5.0")),   # ax        m/s²    (-15 ~ 15)
+    float(os.getenv("OBS_SCALE_AY",          "5.0")),   # ay        m/s²    (-15 ~ 15)
+    float(os.getenv("OBS_SCALE_TORQUE",    "2520.0")),   # total_torque Nm   (-2520 ~ 2520)
+    float(os.getenv("OBS_SCALE_STEER",       "9.425")),    # steering_cmd rad  (-0.7 ~ 0.7)
+    float(os.getenv("OBS_SCALE_YAW_SQ_ERR",  "0.16")),   # yaw_rate_sq_error (0 ~ 16→sqrt→4)
+], dtype=np.float32)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,8 +224,11 @@ class CarMaker4WIDEnv(gym.Env):
         self.episode_saturation_penalty_sum = 0.0
 
         # 에피소드 설정
-        self.max_steps        = int(os.getenv("EPISODE_MAX_STEPS", "15300"))   # HWFET: 765s / 0.05s
-        self.early_done_penalty = float(os.getenv("EARLY_DONE_PENALTY", "-200000.0"))
+        # EPISODE_MAX_STEPS 미지정 시 시나리오 CSV의 마지막 time 기준 자동 계산됨
+        # 수동 지정: WLTP=36000, HWFET=15300, FTP75=49480
+        self._episode_max_steps_override = int(os.getenv("EPISODE_MAX_STEPS", "0"))
+        self.max_steps        = self._episode_max_steps_override if self._episode_max_steps_override > 0 else 36000
+        self.early_done_penalty = float(os.getenv("EARLY_DONE_PENALTY", "-50.0"))
         self.control_dt       = max(CONTROL_DT, 1e-3)
 
         # 내부 상태
@@ -243,9 +279,12 @@ class CarMaker4WIDEnv(gym.Env):
         self._in_sim_tail = False
 
         # 액션·관측 공간
+        # action_space는 항상 3D [-1,1] 유지 (Stage 1에서도 동일)
+        # Stage 1에서 fr_bias(action[1,2])는 _build_assessment_action에서 0으로 강제됨
+        # (high=low=0 으로 설정하면 SAC Gaussian scale=0 → NaN 발생)
         self.action_space = spaces.Box(
             low=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
-            high=np.array([1.0,  1.0,  1.0],  dtype=np.float32),
+            high=np.array([ 1.0,  1.0,  1.0], dtype=np.float32),
             dtype=np.float32,
         )
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
@@ -260,22 +299,30 @@ class CarMaker4WIDEnv(gym.Env):
         ref_yaw_rate: float,
         wheel_torques: np.ndarray,
         wheel_saturation_penalty: float,
-        batt_net_power_w: float = 0.0,
+        total_torque: float = 0.0,
     ):
         """
         ════════════════════════════════════════════════
         보상 함수  ◀  수정 포인트
         ════════════════════════════════════════════════
         반환: (reward, yaw_penalty, effort_penalty, saturation_penalty, energy_penalty)
+        energy_penalty: 등분배 대비 상대 에너지 절감량 (양수 = RL이 더 효율적)
         """
-        # actual과 ref 중 큰 쪽으로 정규화:
-        #   직진(ref≈0, actual 작음) → actual이 분모 → 작은 모멘트도 엄격하게 패널티
-        #   코너링(ref 큼, actual 못 미침) → ref가 분모 → 물리적 한계에 관대하게
-        yaw_den = max(abs(actual_yaw_rate), abs(ref_yaw_rate), YAW_RATE_NORM_EPS)
-        yaw_penalty        = YAW_RATE_WEIGHT * ((actual_yaw_rate - ref_yaw_rate) / yaw_den) ** 2
-        effort_penalty     = ACTION_EFFORT_WEIGHT * float(np.sum((wheel_torques / WHEEL_TORQUE_LIMIT) ** 2))
-        sat_penalty        = SATURATION_PENALTY_WEIGHT * wheel_saturation_penalty
-        energy_penalty     = ENERGY_LOSS_WEIGHT * float(batt_net_power_w)
+        # ref 기준 정규화 + clamp:
+        #   직진(ref≈0) → denom=EPS → 작은 모멘트도 엄격하게 패널티
+        #   코너링(ref 큼) → ref가 분모 → 상대 오차
+        #   물리적 한계 구간(norm_err 폭발) → clamp=2.0으로 상한 제한
+        yaw_den        = max(abs(ref_yaw_rate), YAW_RATE_NORM_EPS)
+        yaw_norm_err   = min(abs((actual_yaw_rate - ref_yaw_rate) / yaw_den), 2.0)
+        yaw_penalty    = YAW_RATE_WEIGHT * yaw_norm_err ** 2
+        effort_penalty = ACTION_EFFORT_WEIGHT * float(np.sum((wheel_torques / WHEEL_TORQUE_LIMIT) ** 2))
+        sat_penalty    = SATURATION_PENALTY_WEIGHT * wheel_saturation_penalty
+        # 에너지: 등분배(algo0) 대비 상대 절감량으로 정규화
+        ref_torques    = np.full(4, total_torque / 4.0, dtype=np.float64)
+        batt_rl        = compute_batt_net_power(wheel_torques, self.last_rotv, self.motor_map)
+        batt_ref       = compute_batt_net_power(ref_torques,   self.last_rotv, self.motor_map)
+        energy_saving  = (batt_ref - batt_rl) / max(abs(batt_ref), 1.0)  # 양수=절감, 음수=낭비
+        energy_penalty = -ENERGY_LOSS_WEIGHT * energy_saving              # 보상에 더하기 위해 부호 반전
         reward = -(yaw_penalty + effort_penalty + sat_penalty + energy_penalty)
         return reward, yaw_penalty, effort_penalty, sat_penalty, energy_penalty
 
@@ -305,6 +352,12 @@ class CarMaker4WIDEnv(gym.Env):
             self.current_scenario_path = path
             self.scenario.reset()
             self.scenario_global_step  = 0
+            # 시나리오 지속 시간으로 max_steps 자동 설정 (EPISODE_MAX_STEPS 미지정 시)
+            if self._episode_max_steps_override <= 0 and \
+               self.scenario.time_arr is not None and self.scenario.time_arr.size > 0:
+                self.max_steps = int(np.ceil(float(self.scenario.time_arr[-1]) / self.control_dt))
+                print(f"[SCENARIO] max_steps={self.max_steps} "
+                      f"({self.scenario.time_arr[-1]:.1f}s / {self.control_dt}s)")
         else:
             self.current_scenario_path = None
             self.scenario = ScenarioProfile()
@@ -534,11 +587,12 @@ class CarMaker4WIDEnv(gym.Env):
             yaw_rate_sq_error   = float((actual_yaw_rate - ref_yaw_rate) ** 2)
             self.last_yaw_rate_sq_error = yaw_rate_sq_error
             obs.append(yaw_rate_sq_error)
+            obs = (np.array(obs, dtype=np.float32) / OBS_SCALE).tolist()
             self.last_obs = obs
 
-            batt_net_power_w = compute_batt_net_power(wheel_torques, self.last_rotv, self.motor_map)
             reward, yaw_pen, effort_pen, sat_pen, energy_pen = self._compute_reward(
-                actual_yaw_rate, ref_yaw_rate, wheel_torques, wheel_saturation_penalty, batt_net_power_w
+                actual_yaw_rate, ref_yaw_rate, wheel_torques, wheel_saturation_penalty,
+                float(self.last_total_torque),
             )
 
             terminated = False  # 시뮬 상태는 소켓 끊김으로만 감지
@@ -616,6 +670,17 @@ def seed_replay_buffer_from_csv(model, rb_dir: str) -> int:
     import glob
     import pandas as pd
 
+    # 상대경로면 스크립트 위치 기준 절대경로로 변환 (CarMaker가 cwd를 바꿔도 동작)
+    rb_path = Path(rb_dir)
+    if not rb_path.is_absolute():
+        rb_path = _SCRIPT_DIR / rb_path
+    rb_dir = str(rb_path)
+
+    # 에너지 계산용 모터맵 (batt_rl vs batt_ref 비교에 사용)
+    _WHEEL_R = 0.33  # 타이어 반경(m) 근사 - rotv = speed_mps / WHEEL_R
+    _mm = MotorMap(Path(os.getenv("MG_MAP_PATH", str(_SCRIPT_DIR / "scaled_mg_map.mat"))))
+    _mm.load()
+
     files = sorted(
         glob.glob(os.path.join(rb_dir, "*_algo2_*.csv")) +
         glob.glob(os.path.join(rb_dir, "*_algo3_*.csv"))
@@ -639,7 +704,7 @@ def seed_replay_buffer_from_csv(model, rb_dir: str) -> int:
                         - df["sat_regen_torque_total_nm"].values)
         yaw_rate = df["veh_yaw_rate"].values
         ref_yr   = df["ref_yaw_rate"].values
-        obs = np.column_stack([
+        obs = (np.column_stack([
             df["veh_speed"].values * 3.6,       # speed_kph
             yaw_rate,                            # yaw_rate
             df["veh_ax"].values,                 # ax
@@ -647,7 +712,7 @@ def seed_replay_buffer_from_csv(model, rb_dir: str) -> int:
             total_torque,                        # total_torque
             df["steering_cmd"].values,           # steering_cmd
             (yaw_rate - ref_yr) ** 2,            # yaw_rate_sq_error
-        ]).astype(np.float32)
+        ]) / OBS_SCALE).astype(np.float32)
 
         # ── action 역산 ──────────────────────────────────────────────────────
         fl = df["torque_fl"].values
@@ -663,10 +728,21 @@ def seed_replay_buffer_from_csv(model, rb_dir: str) -> int:
 
         # ── reward ───────────────────────────────────────────────────────────
         wt   = np.column_stack([fl, fr, rl, rr])
-        yden = np.maximum(np.maximum(np.abs(yaw_rate), np.abs(ref_yr)), YAW_RATE_NORM_EPS)
-        yaw_pen    = YAW_RATE_WEIGHT    * ((yaw_rate - ref_yr) / yden) ** 2
+        yden       = np.maximum(np.abs(ref_yr), YAW_RATE_NORM_EPS)
+        yaw_norm   = np.clip(np.abs((yaw_rate - ref_yr) / yden), 0.0, 2.0)
+        yaw_pen    = YAW_RATE_WEIGHT * yaw_norm ** 2
         effort_pen = ACTION_EFFORT_WEIGHT * np.sum((wt / WHEEL_TORQUE_LIMIT) ** 2, axis=1)
-        energy_pen = ENERGY_LOSS_WEIGHT   * df["batt_net_power_w"].values
+        # 에너지: 동일 총 요구토크를 등분배했을 때 vs RL(algo2/3) 실제 배분 비교
+        # rotv는 현재 속도로 근사 (omega ≈ v / r_wheel, 4바퀴 동일 가정)
+        speed_mps = df["veh_speed"].values
+        omega_vec = speed_mps / _WHEEL_R
+        total_tq  = fl + fr + rl + rr
+        tq_rl_mat  = np.column_stack([fl, fr, rl, rr]).astype(np.float64)
+        tq_ref_mat = np.column_stack([total_tq / 4.0] * 4).astype(np.float64)
+        batt_rl_arr  = compute_batt_net_power_batch(tq_rl_mat,  omega_vec, _mm)
+        batt_ref_arr = compute_batt_net_power_batch(tq_ref_mat, omega_vec, _mm)
+        energy_saving = (batt_ref_arr - batt_rl_arr) / np.maximum(np.abs(batt_ref_arr), 1.0)
+        energy_pen = (-ENERGY_LOSS_WEIGHT * energy_saving).astype(np.float32)
         rew = -(yaw_pen + effort_pen + energy_pen).astype(np.float32)
 
         # ── t → t+1 페어링 ──────────────────────────────────────────────────
@@ -707,8 +783,11 @@ def seed_replay_buffer_from_csv(model, rb_dir: str) -> int:
     buf.observations[:total, 0, :]      = obs_a
     buf.next_observations[:total, 0, :] = nxt_a
     buf.actions[:total, 0, :]           = act_a
-    buf.rewards[:total, 0]              = rew_a
+    buf.rewards[:total, 0]              = rew_a.reshape(-1, 1) if buf.rewards.ndim == 3 else rew_a
     buf.dones[:total, 0]                = don_a
+    # timeouts: 에피소드 경계(done=1)를 timeout(truncation)으로 표시
+    if hasattr(buf, "timeouts"):
+        buf.timeouts[:total, 0] = don_a
     buf.pos  = total % buf_cap
     buf.full = total >= buf_cap
 
@@ -737,11 +816,18 @@ def run_learning(env):
         algo_kwargs  = TD3_PRESETS[profile]
         model_class  = TD3
 
-    model_path          = f"{MODEL_BASENAME}.zip"
-    best_model_path     = f"{MODEL_BASENAME}_best.zip"
-    latest_model_path   = f"{MODEL_BASENAME}.zip"
-    interrupt_model_path = f"{MODEL_BASENAME}_interrupt.zip"
-    tensorboard_log_dir = os.getenv("TENSORBOARD_LOG", f"{MODEL_BASENAME}_tensorboard")
+    # 커리큘럼 단계별 모델 경로 및 기본 timesteps 설정
+    if CURRICULUM_STAGE in (1, 2):
+        _basename = f"{MODEL_BASENAME}_s{CURRICULUM_STAGE}"
+        print(f"--- [CURRICULUM] Stage {CURRICULUM_STAGE} ---")
+    else:
+        _basename = MODEL_BASENAME
+
+    model_path          = f"{_basename}.zip"
+    best_model_path     = f"{_basename}_best.zip"
+    latest_model_path   = f"{_basename}.zip"
+    interrupt_model_path = f"{_basename}_interrupt.zip"
+    tensorboard_log_dir = os.getenv("TENSORBOARD_LOG", f"{_basename}_tensorboard")
     callback = SaveBestEpisodeRewardCallback(best_model_path, latest_model_path=latest_model_path)
 
     print(f"--- ALGO: {algo.upper()} | 프로필: {profile} ---")
@@ -749,6 +835,15 @@ def run_learning(env):
     print(f"--- TensorBoard 로그 경로: {tensorboard_log_dir} ---")
 
     load_path = os.getenv("LOAD_MODEL_PATH", "").strip()
+    # Stage 2: LOAD_MODEL_PATH 미지정 시 Stage 1 best 모델 자동 탐색
+    if not load_path and CURRICULUM_STAGE == 2:
+        s1_best = f"{MODEL_BASENAME}_s1_best.zip"
+        if os.path.exists(s1_best):
+            load_path = s1_best
+            print(f"[CURRICULUM] Stage 2: Stage 1 best 자동 로드: '{load_path}'")
+        else:
+            print(f"[CURRICULUM] Stage 2: Stage 1 best 없음 ({s1_best}), 새 모델로 시작합니다.")
+
     if load_path and os.path.exists(load_path):
         print(f"--- 체크포인트 로드: '{load_path}' -> 저장 경로: '{model_path}' ---")
         model = model_class.load(load_path, env=env, device="cuda", verbose=1, tensorboard_log=tensorboard_log_dir)
@@ -792,9 +887,15 @@ def run_learning(env):
     # 리플레이 버퍼 시딩 (SAC/TD3 전용, RB_SEED_DIR 설정 시)
     rb_seed_dir = os.getenv("RB_SEED_DIR", "").strip()
     if rb_seed_dir and algo in {"sac", "td3"}:
-        seed_replay_buffer_from_csv(model, rb_seed_dir)
+        n_seeded = seed_replay_buffer_from_csv(model, rb_seed_dir)
+        if n_seeded > 0:
+            # 버퍼가 이미 채워졌으므로 warm-up 대기 없이 즉시 gradient update 시작
+            model.learning_starts = 0
+            print(f"[SEED] learning_starts → 0 (버퍼 {n_seeded:,}개 pre-filled)")
 
-    total_timesteps = int(os.getenv("TOTAL_TIMESTEPS", "1000000"))
+    # Stage 1 기본 max step: 50만, 그 외: 100만 (TOTAL_TIMESTEPS 환경변수로 덮어쓰기 가능)
+    _default_ts = "500000" if CURRICULUM_STAGE == 1 else "1000000"
+    total_timesteps = int(os.getenv("TOTAL_TIMESTEPS", _default_ts))
     try:
         model.learn(total_timesteps=total_timesteps, callback=callback)
     except KeyboardInterrupt:

@@ -11,7 +11,9 @@ CarMaker GUI + 학습된 PPO 모델 inference 스크립트.
     CM_PORT             : CarMaker 소켓 포트 (기본값: 5555)
     REALTIME_FACTOR     : 실시간 배율 (기본값: 1.0)
     EPISODE_MAX_STEPS   : 에피소드 최대 스텝 (기본값: 50000)
-    TELEMETRY_DIR       : CSV 저장 디렉토리 (기본값: telemetry)
+    TELEMETRY_DIR       : CSV 저장 디렉토리 (기본값: output)
+    NUM_EPISODES        : 실행할 에피소드 수 (기본값: 1)
+    CURRICULUM_STAGE    : 커리큘럼 스테이지 (1이면 fr_bias 강제 0.0, 기본값: 0)
 """
 import os
 import sys
@@ -174,7 +176,7 @@ async def main():
     env_async.max_steps = int(os.getenv("EPISODE_MAX_STEPS", "50000"))
     use_open_loop = bool(env_async.use_open_loop_steer)
 
-    telemetry_dir = Path(os.getenv("TELEMETRY_DIR", str(PROJECT_DIR / "telemetry")))
+    telemetry_dir = Path(os.getenv("TELEMETRY_DIR", str(PROJECT_DIR / "output")))
     telemetry_dir.mkdir(parents=True, exist_ok=True)
     model_tag = Path(model_path).stem
 
@@ -243,9 +245,11 @@ def run_inference(model: PPO, env: SyncBridge, env_async: CarMaker4WIDEnv,
     mode='ppo'    : PPO 모델로 액션 예측 (deterministic)
     mode='uniform': 고정 균등 편차 액션 [0.0, 0.0, 0.0] 사용 (비교용 baseline)
     """
+    num_episodes = int(os.getenv("NUM_EPISODES", "1"))
+    curriculum_stage = int(os.getenv("CURRICULUM_STAGE", "0"))
     episode = 0
     try:
-        while True:
+        while episode < num_episodes:
             episode += 1
             obs, _ = env.reset()
             episode_reward = 0.0
@@ -269,6 +273,9 @@ def run_inference(model: PPO, env: SyncBridge, env_async: CarMaker4WIDEnv,
                         action = UNIFORM_ACTION.copy()
                     else:
                         action, _ = model.predict(obs, deterministic=True)
+                        if curriculum_stage == 1:
+                            action[1] = 0.0  # left_fr_bias 고정 (50/50)
+                            action[2] = 0.0  # right_fr_bias 고정 (50/50)
                         # print(obs)
 
                     obs, reward, terminated, truncated, info = env.step(action)

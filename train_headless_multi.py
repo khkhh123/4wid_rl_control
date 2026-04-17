@@ -21,11 +21,14 @@ from train_with_cm_gui import (
     TD3_PRESETS,
     WHEEL_TORQUE_LIMIT,
     MODEL_BASENAME,
+    OBS_SCALE,
+    CURRICULUM_STAGE,
     CarMaker4WIDEnv,
     SyncBridge,
     recv_exact,
     cmapi,
     get_ppo_profile,
+    seed_replay_buffer_from_csv,
 )
 from experiment_modes import resolve_num_workers
 from experiment_modes import RUN_MODE_HEADLESS
@@ -83,9 +86,10 @@ class SaveBestEpisodeRewardVecCallback(BaseCallback):
             episode_reward = float(self.current_episode_rewards[idx])
             # 항목별 누적 (info에서 읽기)
             ep_info = infos[idx].get("episode", {}) if infos else {}
-            yaw_pen = ep_info.get("yaw_penalty", 0.0)
-            effort_pen = ep_info.get("effort_penalty", 0.0)
-            sat_pen = ep_info.get("saturation_penalty", 0.0)
+            yaw_pen    = ep_info.get("yaw_penalty",        0.0)
+            effort_pen = ep_info.get("effort_penalty",     0.0)
+            sat_pen    = ep_info.get("saturation_penalty", 0.0)
+            eng_pen    = ep_info.get("energy_penalty",     0.0)
             # 매 에피소드 latest 저장
             self.model.save(self.latest_model_path)
             if episode_reward > self.best_episode_reward:
@@ -95,13 +99,17 @@ class SaveBestEpisodeRewardVecCallback(BaseCallback):
                 if self.verbose:
                     print(f"[BEST] episode={self.episode_count} reward={self.best_episode_reward:.3f}")
             # TensorBoard 로깅
-            self.logger.record("episode/reward", episode_reward)
-            self.logger.record("episode/count", self.episode_count)
-            self.logger.record("episode/best_reward", self.best_episode_reward)
-            self.logger.record("episode/yaw_penalty", yaw_pen)
-            self.logger.record("episode/effort_penalty", effort_pen)
-            self.logger.record("episode/saturation_penalty", sat_pen)
+            self.logger.record("episode/reward",              episode_reward)
+            self.logger.record("episode/count",               self.episode_count)
+            self.logger.record("episode/best_reward",         self.best_episode_reward)
+            self.logger.record("episode/yaw_penalty",         yaw_pen)
+            self.logger.record("episode/effort_penalty",      effort_pen)
+            self.logger.record("episode/saturation_penalty",  sat_pen)
+            self.logger.record("episode/energy_penalty",      eng_pen)
             self.logger.dump(self.num_timesteps)
+            if self.verbose:
+                print(f"[EP {self.episode_count}] reward={episode_reward:.3f} "
+                      f"| yaw={yaw_pen:.3f} effort={effort_pen:.3f} sat={sat_pen:.3f} energy={eng_pen:.3f}")
             self.current_episode_rewards[idx] = 0.0
         return True
 
@@ -269,7 +277,7 @@ class HeadlessWorkerEnv(gym.Env):
                 obs.append(self.env_async.last_total_torque)
                 obs.append(self.env_async.last_steering_cmd)
                 obs.append(self.env_async.last_yaw_rate_sq_error)
-                self.env_async.last_obs = obs
+                self.env_async.last_obs = (np.asarray(obs, dtype=np.float32) / OBS_SCALE).tolist()
 
                 self._wlog("initial obs recv done")
                 self.env_async.ready_evt.set()
@@ -455,8 +463,8 @@ def build_worker_env(worker_id: int):
     # Default: isolate each worker's model/log files to avoid write races.
     model_mode = env.setdefault("MULTI_MODEL_MODE", "per_worker").strip().lower()
     if model_mode == "per_worker":
-        base = os.getenv("MODEL_BASENAME", "carmaker_sac_4wid_dyc_C")
-        tb = os.getenv("TB_DIRNAME", "carmaker_sac_4wid_dyc_tensorboard")
+        base = os.getenv("MODEL_BASENAME", MODEL_BASENAME)
+        tb = os.getenv("TB_DIRNAME", f"{os.path.basename(MODEL_BASENAME)}_tensorboard")
         env.setdefault("MODEL_BASENAME", f"{base}_w{worker_id}")
         env.setdefault("TB_DIRNAME", f"{tb}_w{worker_id}")
 
@@ -489,15 +497,24 @@ def run_shared_training(num_workers: int, profile: str):
     heartbeat_sec = float(os.getenv("SHARED_HEARTBEAT_SEC", "5"))
 
     model_basename = os.getenv("MODEL_BASENAME", MODEL_BASENAME)
-    tb_dir = os.getenv("TENSORBOARD_LOG", f"{model_basename}_tensorboard")
+
+    # 커리큘럼 단계별 suffix 및 기본 timesteps
+    if CURRICULUM_STAGE in (1, 2):
+        _basename = f"{model_basename}_s{CURRICULUM_STAGE}"
+        print(f"[SHARED] [CURRICULUM] Stage {CURRICULUM_STAGE}")
+    else:
+        _basename = model_basename
+
+    tb_dir = os.getenv("TENSORBOARD_LOG", f"{_basename}_tensorboard")
     log_dir = str(PROJECT_DIR / tb_dir)
     os.makedirs(log_dir, exist_ok=True)
 
-    model_path = str(PROJECT_DIR / f"{model_basename}.zip")
-    best_model_path = str(PROJECT_DIR / f"{model_basename}_best.zip")
-    latest_model_path = str(PROJECT_DIR / f"{model_basename}_latest.zip")
-    interrupt_model_path = str(PROJECT_DIR / f"{model_basename}_interrupt.zip")
-    total_timesteps = int(os.getenv("TOTAL_TIMESTEPS", "5000000"))
+    model_path = str(PROJECT_DIR / f"{_basename}.zip")
+    best_model_path = str(PROJECT_DIR / f"{_basename}_best.zip")
+    latest_model_path = str(PROJECT_DIR / f"{_basename}_latest.zip")
+    interrupt_model_path = str(PROJECT_DIR / f"{_basename}_interrupt.zip")
+    _default_ts = "500000" if CURRICULUM_STAGE == 1 else "5000000"
+    total_timesteps = int(os.getenv("TOTAL_TIMESTEPS", _default_ts))
 
     env_fns = [
         make_shared_worker_env(
@@ -511,7 +528,7 @@ def run_shared_training(num_workers: int, profile: str):
     ]
     vec_env = VecMonitor(
         SubprocVecEnv(env_fns, start_method="spawn"),
-        info_keywords=("yaw_penalty", "effort_penalty", "saturation_penalty"),
+        info_keywords=("yaw_penalty", "effort_penalty", "saturation_penalty", "energy_penalty"),
     )
     best_callback = SaveBestEpisodeRewardVecCallback(
         best_model_path=best_model_path, latest_model_path=latest_model_path, n_envs=num_workers
@@ -532,6 +549,14 @@ def run_shared_training(num_workers: int, profile: str):
     try:
         # LOAD_MODEL_PATH: 로드할 체크포인트 경로 (저장은 model_path/best_model_path 유지)
         load_path = os.getenv("LOAD_MODEL_PATH", "").strip()
+        # Stage 2: LOAD_MODEL_PATH 미지정 시 Stage 1 best 자동 탐색
+        if not load_path and CURRICULUM_STAGE == 2:
+            s1_best = str(PROJECT_DIR / f"{model_basename}_s1_best.zip")
+            if os.path.exists(s1_best):
+                load_path = s1_best
+                print(f"[CURRICULUM] Stage 2: Stage 1 best 자동 로드: '{load_path}'")
+            else:
+                print(f"[CURRICULUM] Stage 2: Stage 1 best 없음 ({s1_best}), 새 모델로 시작합니다.")
         if load_path and os.path.exists(load_path):
             print(f"[SHARED] 체크포인트 로드: '{load_path}' -> 저장 경로: '{model_path}'")
             model = model_class.load(load_path, env=vec_env, device="cuda", verbose=1, tensorboard_log=log_dir)
@@ -571,6 +596,14 @@ def run_shared_training(num_workers: int, profile: str):
             model.target_policy_noise = algo_kwargs["target_policy_noise"]
             model.target_noise_clip = algo_kwargs["target_noise_clip"]
         model.tensorboard_log = log_dir
+
+        # 리플레이 버퍼 시딩 (SAC/TD3 전용, RB_SEED_DIR 설정 시)
+        rb_seed_dir = os.getenv("RB_SEED_DIR", "").strip()
+        if rb_seed_dir and algo in {"sac", "td3"}:
+            n_seeded = seed_replay_buffer_from_csv(model, rb_seed_dir)
+            if n_seeded > 0:
+                model.learning_starts = 0
+                print(f"[SEED] learning_starts → 0 (버퍼 {n_seeded:,}개 pre-filled)")
 
         model.learn(total_timesteps=total_timesteps, callback=callback)
     except KeyboardInterrupt:
