@@ -28,6 +28,7 @@ from stable_baselines3 import PPO, SAC
 sys.path.append("/opt/ipg/carmaker/linux64-14.0.1/Python/python3.10")
 import cmapi
 
+from carmaker_utils import compute_batt_net_power
 from train_with_cm_gui import (
     CarMaker4WIDEnv,
     SyncBridge,
@@ -90,6 +91,12 @@ def build_csv_row(env_async: CarMaker4WIDEnv, sim_time: float) -> dict:
     sat_drive = sum(t for t in [tfl, tfr, trl, trr] if t > 0)
     sat_regen = sum(abs(t) for t in [tfl, tfr, trl, trr] if t < 0)
 
+    wheel_torques = np.array([tfl, tfr, trl, trr], dtype=np.float32)
+    rotv = np.array(s[4:8], dtype=np.float32)  # rotv_fl, fr, rl, rr
+    batt_net = compute_batt_net_power(wheel_torques, rotv, env_async.motor_map)
+    batt_drive_p = batt_net if batt_net > 0 else 0.0
+    batt_regen_p = -batt_net if batt_net < 0 else 0.0
+
     return {
         "sim_time": sim_time,
         "veh_x": s[0], "veh_y": s[1], "veh_yaw": s[2],
@@ -108,9 +115,9 @@ def build_csv_row(env_async: CarMaker4WIDEnv, sim_time: float) -> dict:
         "sat_drive_torque_total_nm": sat_drive,
         "req_regen_torque_total_nm": req_regen,
         "sat_regen_torque_total_nm": sat_regen,
-        "batt_drive_power_w": 0.0,
-        "batt_regen_power_w": 0.0,
-        "batt_net_power_w": 0.0,
+        "batt_drive_power_w": batt_drive_p,
+        "batt_regen_power_w": batt_regen_p,
+        "batt_net_power_w": batt_net,
         "ref_yaw_rate_base": ai.get("ref_yaw_rate_base", 0.0),
         "ref_yaw_rate": ai.get("ref_yaw_rate", 0.0),
         "torque_fl": tfl, "torque_fr": tfr, "torque_rl": trl, "torque_rr": trr,

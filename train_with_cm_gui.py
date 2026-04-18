@@ -306,7 +306,7 @@ class CarMaker4WIDEnv(gym.Env):
         보상 함수  ◀  수정 포인트
         ════════════════════════════════════════════════
         반환: (reward, yaw_penalty, effort_penalty, saturation_penalty, energy_penalty)
-        energy_penalty: 등분배 대비 상대 에너지 절감량 (양수 = RL이 더 효율적)
+        energy_penalty: 양수 = RL이 균등분배보다 에너지 더 씀 (reward 감소), 음수 = 절감 (reward 증가)
         """
         # ref 기준 정규화 + clamp:
         #   직진(ref≈0) → denom=EPS → 작은 모멘트도 엄격하게 패널티

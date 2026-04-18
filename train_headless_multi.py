@@ -597,6 +597,21 @@ def run_shared_training(num_workers: int, profile: str):
             model.target_noise_clip = algo_kwargs["target_noise_clip"]
         model.tensorboard_log = log_dir
 
+        # 리플레이 버퍼 로드 (SAC/TD3, 이어서 학습 시)
+        if load_path and algo in {"sac", "td3"}:
+            rb_candidates = [
+                model_path.replace(".zip", "_replay_buffer.pkl"),   # 현재 스테이지 버퍼
+                load_path.replace(".zip", "_replay_buffer.pkl"),     # 로드한 모델의 버퍼
+            ]
+            for rb_path in rb_candidates:
+                if os.path.exists(rb_path):
+                    model.load_replay_buffer(rb_path)
+                    print(f"[SHARED] Replay buffer loaded: {rb_path} ({model.replay_buffer.size():,} transitions)")
+                    model.learning_starts = 0
+                    break
+            else:
+                print("[SHARED] Replay buffer not found. Starting with empty buffer.")
+
         # 리플레이 버퍼 시딩 (SAC/TD3 전용, RB_SEED_DIR 설정 시)
         rb_seed_dir = os.getenv("RB_SEED_DIR", "").strip()
         if rb_seed_dir and algo in {"sac", "td3"}:
@@ -605,7 +620,9 @@ def run_shared_training(num_workers: int, profile: str):
                 model.learning_starts = 0
                 print(f"[SEED] learning_starts → 0 (버퍼 {n_seeded:,}개 pre-filled)")
 
-        model.learn(total_timesteps=total_timesteps, callback=callback)
+        reset_num_timesteps = not bool(load_path)
+        model.learn(total_timesteps=total_timesteps, callback=callback,
+                    reset_num_timesteps=reset_num_timesteps)
     except KeyboardInterrupt:
         print("[SHARED] Training interrupted. Saving interrupt model...")
         model.save(interrupt_model_path)
@@ -616,6 +633,13 @@ def run_shared_training(num_workers: int, profile: str):
             print(f"[SHARED] Model saved to {model_path}")
         except Exception:
             pass
+        if algo in {"sac", "td3"}:
+            try:
+                rb_save_path = model_path.replace(".zip", "_replay_buffer")
+                model.save_replay_buffer(rb_save_path)
+                print(f"[SHARED] Replay buffer saved to {rb_save_path}.pkl")
+            except Exception as e:
+                print(f"[SHARED] Replay buffer save warning: {e}")
         try:
             vec_env.close()
         except Exception as e:
