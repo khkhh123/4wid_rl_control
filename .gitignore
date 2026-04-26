@@ -18,3 +18,5 @@
 /scenarios/
 /telemetry/
 /output/
+/*tensorboard/
+*.log

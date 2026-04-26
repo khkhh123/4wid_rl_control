@@ -157,7 +157,7 @@ class RequiredYawMomentController:
     """EKF lateral-force observer + sliding-mode yaw-moment controller."""
 
     def __init__(self):
-        self.smc_k = env_float("YAWM_SMC_K", 200.0)
+        self.smc_k = env_float("YAWM_SMC_K", 10.0)
         self.smc_eps = env_float("YAWM_SMC_EPS", 0.2)
         self.yaw_moment_limit = env_float("YAWM_LIMIT_NM", 10000.0)
 
